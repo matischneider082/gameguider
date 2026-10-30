@@ -77,6 +77,40 @@ class Writes(LibraryTests):
                 self.assertEqual(errors, [])
                 self.assertEqual(sorted(g.name for g in library.read_games(folder)), sorted(names))
 
+    def test_renaming_a_tracked_game_onto_another_games_name_is_rejected(self):
+        library.save_game("Hades", platform="Switch", directory=self.dir)
+        library.save_game("Celeste", platform="PC", directory=self.dir)
+
+        with self.assertRaises(ValueError):
+            library.save_game("Celeste", platform="PC", spot="Chapter 3", lookup_slug="hades", directory=self.dir)
+
+        games = {g.slug: g for g in library.read_games(self.dir)}
+        # The rename must not spill onto Celeste's row: both games keep their own metadata.
+        self.assertEqual(set(games), {"hades", "celeste"})
+        self.assertEqual((games["hades"].platform, games["hades"].spot), ("Switch", ""))
+        self.assertEqual((games["celeste"].platform, games["celeste"].spot), ("PC", ""))
+
+    def test_rename_rejection_does_not_depend_on_row_order(self):
+        library.save_game("Celeste", directory=self.dir)
+        library.save_game("Hades", directory=self.dir)
+
+        with self.assertRaises(ValueError):
+            library.save_game("Celeste", spot="Chapter 3", lookup_slug="hades", directory=self.dir)
+
+        # Hades keeps its own row: no second celeste slug sharing one notes file.
+        self.assertEqual([g.slug for g in library.read_games(self.dir)], ["celeste", "hades"])
+
+    def test_renaming_a_game_to_a_free_name_still_works(self):
+        library.save_game("Hades", status="Paused", directory=self.dir)
+
+        library.save_game("Hades II", status="Paused", lookup_slug="hades", directory=self.dir)
+
+        games = library.read_games(self.dir)
+        self.assertEqual([g.slug for g in games], ["hades-ii"])
+        self.assertEqual(games[0].status, "Paused")  # renamed in place: the row's metadata carried over
+        self.assertTrue((self.dir / "hades-ii.md").is_file())
+        self.assertFalse((self.dir / "hades.md").exists())
+
     def test_failed_write_keeps_the_old_file_and_leaves_no_temp_file(self):
         library.save_game("Celeste", directory=self.dir)
         before = (self.dir / "GAMES.md").read_text(encoding="utf-8")
@@ -86,6 +120,7 @@ class Writes(LibraryTests):
         self.assertEqual((self.dir / "GAMES.md").read_text(encoding="utf-8"), before)
         self.assertEqual(sorted(self.dir.iterdir()), files)
 
+    @unittest.skipUnless(os.name == "posix", "file modes and umask are POSIX concepts")
     def test_writes_keep_the_file_mode_and_new_files_follow_the_umask(self):
         umask = os.umask(0)
         os.umask(umask)

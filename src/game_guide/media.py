@@ -193,5 +193,5 @@ def play(video):
     """Open the video at its timestamp in an mpv window. Blocks while the video downloads the first time."""
     path = download(video)
     subprocess.Popen(["mpv", f"--start={video.at}", f"--title={video.label}", str(path)],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **procs.GROUP)
     return path

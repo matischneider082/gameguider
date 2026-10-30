@@ -49,6 +49,7 @@ class Ask(unittest.TestCase):
             got = [(e.kind, e.text) for e in backends.ask("codex", "q")]
         self.assertEqual(got, [("error", "boom")])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process probing")
     def test_closing_early_terminates_the_cli(self):
         script = ('import json, os, time\n'
                   'print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": str(os.getpid())}}),'
@@ -63,6 +64,7 @@ class Ask(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):  # terminated and reaped
             os.kill(pid, 0)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process probing")
     def test_closing_early_kills_the_clis_children_too(self):
         script = ('import json, subprocess, sys\n'
                   'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])\n'
@@ -124,6 +126,7 @@ class Download(unittest.TestCase):
                 t.join()
         self.assertEqual(len(self.calls), 1)
 
+    @unittest.skipUnless(os.name == "posix", "a /bin/sh ffmpeg stub")
     def test_ffmpeg_errors_are_captured_for_the_status_line(self):
         bin_dir = self.cache / "bin"
         bin_dir.mkdir()
@@ -178,6 +181,24 @@ class Download(unittest.TestCase):
         self.assertEqual(len(calls), 1)  # the next ffmpeg would start untracked while the app quits
 
 
+class ProcsTreeKill(unittest.TestCase):
+    def test_kill_tree_reaches_a_process_with_children_of_its_own(self):
+        """The tree kill really ends a process that has children, on this platform."""
+        from game_guide import procs
+        cmd = ["cmd", "/c", "ping -n 30 127.0.0.1 > nul"] if procs.WIN else ["sh", "-c", "sleep 30 | cat"]
+        proc = procs.start(cmd)
+        try:
+            self.assertIsNone(proc.poll())  # running
+            procs.kill_tree(proc.pid)
+            self.assertIsNotNone(proc.wait(timeout=10))  # killed, on POSIX and Windows alike
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            procs.untrack(proc)
+
+
+@unittest.skipUnless(os.name == "posix", "sleep and POSIX exit codes")
 class Procs(unittest.TestCase):
     def test_a_process_started_by_a_cancelled_worker_dies_at_once(self):
         from game_guide import procs
@@ -202,6 +223,7 @@ class Procs(unittest.TestCase):
                 procs.untrack(proc)
 
 
+@unittest.skipUnless(os.name == "posix", "sleep and POSIX exit codes")
 class Quit(unittest.IsolatedAsyncioTestCase):
     async def test_quitting_kills_a_running_download_instead_of_waiting(self):
         from textual import work

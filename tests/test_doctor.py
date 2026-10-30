@@ -40,6 +40,7 @@ class Machine(unittest.TestCase):
         return {c.name: c for c in doctor.checks()}
 
 
+@unittest.skipUnless(os.name == "posix", "the stub CLIs are POSIX shebang scripts on PATH")
 class DoctorTests(Machine):
     def test_without_an_ai_it_is_not_ready_and_says_how_to_install_and_sign_in(self):
         checks = self.by_name()
@@ -62,6 +63,14 @@ class DoctorTests(Machine):
         self.assertFalse(checks["yt-dlp"].required)
         self.assertIn("uv tool install yt-dlp", checks["yt-dlp"].fix)
         self.assertNotIn("x@example.com", doctor.report())  # only the yes/no is read
+
+    def test_windows_gets_native_installer_and_package_hints(self):
+        with mock.patch.object(doctor.sys, "platform", "win32"):
+            self.assertIn("install.ps1", doctor._ai_install("claude"))
+            self.assertIn("@openai/codex", doctor._ai_install("codex"))
+            self.assertEqual(doctor._package_fix("ffmpeg"), "winget install ffmpeg")
+        # MEDIA and AI are built at import from the running platform, so the mocked hints above are what
+        # a Windows import would bake into its checks.
 
     def test_an_installed_but_signed_out_ai_is_not_ready(self):
         self.install("claude", "codex", script=SIGNED_OUT)
@@ -99,6 +108,7 @@ class DoctorTests(Machine):
         self.assertEqual(refused.exception.status, 400)
 
 
+@unittest.skipUnless(os.name == "posix", "the stub CLIs are POSIX shebang scripts on PATH")
 class WalkthroughTests(Machine):
     def walk(self, answers, run=None):
         said = []

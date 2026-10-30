@@ -3,9 +3,10 @@
 #
 #   curl -LsSf https://github.com/matischneider082/gameguider/releases/latest/download/install.sh | sh
 #
-# Installs uv if it's missing, the `game-guide` command with uv (into ~/.local), the yt-dlp video downloader, and on
-# macOS the GameGuider app in ~/Applications, pinned to the Dock. Then `game-guide setup` checks what else this
-# machine needs and walks you through connecting your AI (Claude Code or the Codex CLI) if none is ready.
+# Installs uv if it's missing, the `game-guide` command with uv (into ~/.local), the yt-dlp video downloader, on
+# macOS the GameGuider app in ~/Applications pinned to the Dock, and on Linux an application-menu entry. Then
+# `game-guide setup` checks what else this machine needs and walks you through connecting your AI (Claude Code or
+# the Codex CLI) if none is ready. On Windows, use install.ps1 instead.
 # Run it again to update. GAMEGUIDER_VERSION=0.2.0 pins a version; GAMEGUIDER_NO_DOCK=1 leaves the Dock alone;
 # GAMEGUIDER_BASE_URL downloads the release files from somewhere else (a mirror, or a local test server).
 set -eu
@@ -48,6 +49,11 @@ if ! command -v yt-dlp >/dev/null 2>&1; then
   uv tool install yt-dlp || echo "Skipped yt-dlp; videos still open on YouTube."
 fi
 
+if [ "$os" = linux ]; then
+  say "Adding GameGuider to the application menu"
+  "$BIN/game-guide" install-desktop --bin "$BIN" || echo "Skipped the menu entry; start GameGuider with: game-guide web"
+fi
+
 if [ "$os" = macos ]; then
   say "Installing the GameGuider app"
   tmp=$(mktemp -d)
@@ -71,6 +77,8 @@ fi
 say "GameGuider $VERSION is installed"
 if [ "$os" = macos ]; then
   echo "Open GameGuider from the Dock or ~/Applications."
+elif [ "$os" = linux ]; then
+  echo "Open GameGuider from your application menu, or run: game-guide web"
 else
   echo "Run: game-guide web"
 fi

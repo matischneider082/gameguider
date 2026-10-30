@@ -63,10 +63,12 @@ class Notes(unittest.TestCase):
                          ["pokemon-scarlet", "marvels-spider-man-2", "marvels-spider-man-2", "hollow-knight-silksong"])
 
     def test_images_with_title_and_obsidian_embed(self):
-        base = Path("/notes")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name).resolve() / "notes"  # resolve(): notes.images joins and resolves against the real folder
         got = notes.images('![a](p/one.png "a title")\n![[two.png]]\n![[three.png|300]]\n![r](https://x.io/y.png)', base)
-        self.assertEqual(got, [("a", Path("/notes/p/one.png")), ("two.png", Path("/notes/two.png")),
-                               ("three.png", Path("/notes/three.png"))])
+        self.assertEqual(got, [("a", base / "p" / "one.png"), ("two.png", base / "two.png"),
+                               ("three.png", base / "three.png")])
 
 
 if __name__ == "__main__":

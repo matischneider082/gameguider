@@ -1,6 +1,6 @@
 [project]
 name = "game-guide"
-version = "0.2.1"
+version = "0.3.0"
 description = "GameGuider: a game shelf and spoiler-aware walkthrough companion"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,6 +21,7 @@ packages = ["src/game_guide"]
 ".claude-plugin" = "game_guide/_plugin/.claude-plugin"
 "build/icon.icns" = "game_guide/_plugin/build/icon.icns"
 "build/icon.py" = "game_guide/_plugin/build/icon.py"
+"build/icon.png" = "game_guide/_plugin/build/icon.png"
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/skills", "/.claude-plugin", "/build/icon.py", "/build/icon.icns", "/README.md", "/pyproject.toml", "/tests", "/mise.toml", "/uv.lock"]
+include = ["/src", "/skills", "/.claude-plugin", "/build/icon.py", "/build/icon.icns", "/build/icon.png", "/build/icon.ico", "/README.md", "/pyproject.toml", "/tests", "/mise.toml", "/uv.lock"]

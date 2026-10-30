@@ -19,7 +19,7 @@ esac
 """
 
 
-@unittest.skipUnless(shutil.which("sh") and shutil.which("sed"), "needs a POSIX shell")
+@unittest.skipUnless(os.name == "posix" and shutil.which("sh") and shutil.which("sed"), "needs a POSIX shell")
 class InstallScriptTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -51,6 +51,9 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("uv tool install --force game-guide @ https://github.com/matischneider082/gameguider/releases/download/"
                       "v0.2.0/game_guide-0.2.0-py3-none-any.whl", calls)
         self.assertIn("game-guide setup", calls)
+        desktop = [c for c in calls if c.startswith("game-guide install-desktop")]
+        self.assertEqual(len(desktop), 1)
+        self.assertIn(f"--bin {self.stubs}", desktop[0])
         self.assertFalse(any("install-app" in c for c in calls))  # Linux: no app
 
     def test_a_copy_from_the_repository_installs_the_latest_release(self):
@@ -82,7 +85,7 @@ class RepositoryTests(unittest.TestCase):
         found = set()
         for name in files or ["README.md", "install.sh"]:
             path = root / name
-            if path.suffix in (".py", ".md", ".sh", ".json", ".toml", ".yml") and path.is_file():
+            if path.suffix in (".py", ".md", ".sh", ".ps1", ".json", ".toml", ".yml") and path.is_file():
                 found |= set(re.findall(r"github\.com/([\w.-]+/(?:game-?guider?|game-guide))\b", path.read_text(encoding="utf-8")))
         self.assertEqual(found, {REPO})
         self.assertIn(f'REPO="{REPO}"', SCRIPT.read_text())

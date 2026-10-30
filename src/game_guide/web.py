@@ -2400,11 +2400,14 @@ function applyStateData(data, switchedGame = false) {
   renderUI();
 }
 
+let stateSeq = 0;
 async function loadState(gameSlug = null, switchedGame = true) {
+  const seq = ++stateSeq;
   const params = new URLSearchParams({ spoiler: state.spoiler });
   if (gameSlug) params.set("game", gameSlug);
   const resp = await fetch(`/api/state?${params}`);
   const data = await resp.json();
+  if (seq !== stateSeq) return;  // a newer load superseded this one (e.g. Answer requested after Hint): showing it would un-redact the page
   applyStateData(data, switchedGame);
 }
 
@@ -2743,6 +2746,7 @@ window.downloadShare = async function(event) {
 window.fetchCover = async function() {
   if (!state.selected) return;
   const gameSlug = state.selected.slug;
+  const requestSpoiler = state.spoiler;
   const button = document.getElementById("fetch-cover");
   const errorEl = document.getElementById("cover-error");
   errorEl.textContent = "";
@@ -2752,8 +2756,8 @@ window.fetchCover = async function() {
     const resp = await fetch("/api/games/artwork", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({game: gameSlug, spoiler: state.spoiler}) });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Could not find cover artwork.");
-    if (state.selected?.slug === gameSlug) applyStateData(data, false);
-    else await loadState(state.selected?.slug, false);
+    if (state.selected?.slug !== gameSlug || state.spoiler !== requestSpoiler) await loadState(state.selected?.slug, false);
+    else applyStateData(data, false);
     showToast("Cover artwork added");
   } catch (err) {
     errorEl.textContent = err.message || "Could not find cover artwork.";
@@ -2768,6 +2772,7 @@ function scoreSummary(score) {
 window.refreshScore = async function() {
   if (!state.selected) return;
   const gameSlug = state.selected.slug;
+  const requestSpoiler = state.spoiler;
   const button = document.getElementById("refresh-score");
   const errorEl = document.getElementById("score-error");
   errorEl.textContent = "";
@@ -2777,8 +2782,8 @@ window.refreshScore = async function() {
     const resp = await fetch("/api/scores/refresh", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({game: gameSlug, spoiler: state.spoiler}) });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw Object.assign(new Error(data.error || ""), { fromServer: true });  // it already says what to do
-    if (state.selected?.slug === gameSlug) applyStateData(data, false);
-    else await loadState(state.selected?.slug, false);
+    if (state.selected?.slug !== gameSlug || state.spoiler !== requestSpoiler) await loadState(state.selected?.slug, false);
+    else applyStateData(data, false);
     showToast("Critic score updated");
   } catch (err) {
     errorEl.textContent = (err.fromServer && err.message) || "Could not fetch a critic score. Check your connection and try again.";
@@ -3380,6 +3385,7 @@ function renderNotesTab() {
 
   const g = state.selected;
   if (state.editingNotes) {
+    if (document.getElementById("raw-notes-textarea")) return;  // the editor is already on screen: a background refresh must not replace the unsaved draft
     controlsEl.innerHTML = `
       <div class="notes-toolbar">
         <div class="notes-toolbar-top">

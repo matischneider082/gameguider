@@ -23,7 +23,8 @@ class SettingsTests(unittest.TestCase):
         self.root = Path(tmp.name).resolve()
         self.home = self.root / "user"
         self.home.mkdir()
-        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config"), "HOME": str(self.home)})
+        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config"), "HOME": str(self.home),
+                                           "USERPROFILE": str(self.home)})  # Windows resolves ~ from USERPROFILE
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("GAME_GUIDE_DIR", None)  # restored when the patch stops

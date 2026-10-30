@@ -3,19 +3,24 @@
 import os
 import signal
 import subprocess
+import sys
 import threading
 
+WIN = sys.platform == "win32"
+# POSIX: each child leads its own process group, so one signal reaches it and everything it spawned. Windows has
+# neither Popen's flag nor killpg; `taskkill /T` is what reaches the whole tree there.
+GROUP = {} if WIN else {"start_new_session": True}
 RUNNING = set()
 LOCK = threading.Lock()
 
 
 def start(cmd, **kwargs):
-    """Popen in its own process group, registered under the lock stop_all takes, so stop_all can't miss it."""
+    """Popen in its own process group (POSIX), registered under the lock stop_all takes, so stop_all can't miss it."""
     with LOCK:
-        proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+        proc = subprocess.Popen(cmd, **{**GROUP, **kwargs})
         RUNNING.add(proc)
         if worker_cancelled():  # the app quit after stop_all took its list (say the next ffmpeg): it dies too
-            kill_group(proc.pid)
+            kill_tree(proc.pid)
     return proc
 
 
@@ -25,7 +30,7 @@ def untrack(proc):
 
 
 def worker_cancelled():
-    """Whether this runs in a Textual worker that was cancelled; the TUI cancels them all before stop_all."""
+    """Whether this runs in a Textual worker that is cancelled; the TUI cancels them all before stop_all."""
     from textual.worker import NoActiveWorker, get_current_worker
     try:
         return get_current_worker().is_cancelled
@@ -33,19 +38,23 @@ def worker_cancelled():
         return False
 
 
-def kill_group(pgid, sig=signal.SIGTERM):
+def kill_tree(pid, sig=signal.SIGTERM):
+    """Kill a process and everything it spawned (POSIX: the process group; Windows: `taskkill /T`)."""
+    if WIN:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        return
     try:
-        os.killpg(pgid, sig)
+        os.killpg(pid, sig)
     except (ProcessLookupError, PermissionError):  # macOS: EPERM when the group is only an unreaped zombie
         pass
 
 
 def stop_all():
-    """Kill every tracked process and its children (each runs in its own process group)."""
+    """Kill every tracked process and its children."""
     with LOCK:
         procs = list(RUNNING)
     for proc in procs:
-        kill_group(proc.pid)
+        kill_tree(proc.pid)
 
 
 def run(cmd, timeout):
@@ -54,7 +63,7 @@ def run(cmd, timeout):
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            kill_group(proc.pid, signal.SIGKILL)
+            kill_tree(proc.pid, signal.SIGKILL)
             proc.communicate()
             raise
         finally:

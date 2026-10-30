@@ -813,16 +813,22 @@ class CliAndTuiWebIntegrationTests(unittest.IsolatedAsyncioTestCase):
             installed_app = dest_dir / "Game Guide.app"
 
             buf = io.StringIO()
-            with mock.patch("game_guide.desktop.package_app", return_value=fake_app) as pkg_mock, redirect_stdout(buf):
+            with mock.patch.object(cli.sys, "platform", "darwin"), \
+                    mock.patch("game_guide.desktop.package_app", return_value=fake_app) as pkg_mock, redirect_stdout(buf):
                 cli.main(["package-app", "--out-dir", str(out_dir)])
             pkg_mock.assert_called_once_with(out_dir=out_dir)
             self.assertEqual(buf.getvalue().strip(), str(fake_app))
 
             buf = io.StringIO()
-            with mock.patch("game_guide.desktop.install_app", return_value=installed_app) as inst_mock, redirect_stdout(buf):
+            with mock.patch.object(cli.sys, "platform", "darwin"), \
+                    mock.patch("game_guide.desktop.install_app", return_value=installed_app) as inst_mock, redirect_stdout(buf):
                 cli.main(["install-app", "--no-dock", "--dest-dir", str(dest_dir)])
             inst_mock.assert_called_once_with(dest_dir=dest_dir, add_to_dock=False, app=None)
             self.assertEqual(buf.getvalue().strip(), f"Installed {installed_app}")
+
+        with self.assertRaises(SystemExit) as refused, mock.patch.object(cli.sys, "platform", "linux"):
+            cli.main(["install-app", "--no-dock"])
+        self.assertIn("install-desktop", str(refused.exception))
 
     def test_add_app_to_dock_updates_plist_idempotently_without_touching_real_dock(self):
         with tempfile.TemporaryDirectory() as d:

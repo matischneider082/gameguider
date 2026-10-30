@@ -167,13 +167,13 @@ def ask(backend, question, session=None):
                 yield Event("error", stderr.read()[-2000:] or f"{backend} exited with {proc.returncode}")
         finally:
             # Closing the generator early (a superseded question) must not leave the CLI running and editing notes.
-            # The whole group, so yt-dlp/uv children the CLI spawned die with it.
+            # The whole tree, so yt-dlp/uv children the CLI spawned die with it.
             procs.untrack(proc)
-            procs.kill_group(proc.pid, signal.SIGTERM)
+            procs.kill_tree(proc.pid, signal.SIGTERM)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                procs.kill_group(proc.pid, signal.SIGKILL)
+                procs.kill_tree(proc.pid, signal.SIGKILL)
 
 
 def claude_command(question, session, notes):

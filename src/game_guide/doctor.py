@@ -14,19 +14,32 @@ from dataclasses import asdict, dataclass
 from .backends import BACKENDS
 from .notes import games_dir
 
+def _ai_install(backend: str) -> str:
+    """The backend's official installer command for this platform."""
+    if sys.platform == "win32":
+        return {"claude": 'powershell -NoProfile -c "irm https://claude.ai/install.ps1 | iex"',
+                "codex": "npm install -g @openai/codex"}[backend]
+    return {"claude": "curl -fsSL https://claude.ai/install.sh | bash",
+            "codex": "curl -fsSL https://chatgpt.com/codex/install.sh | sh"}[backend]
+
+
 # The AIs GameGuider can use, with their official installers and sign-in commands.
 AI = {
     "claude": {"label": "Claude", "app": "Claude Code", "plan": "a Claude Pro or Max plan, or an Anthropic account",
-               "install": "curl -fsSL https://claude.ai/install.sh | bash", "sign_in": "claude auth login",
+               "install": _ai_install("claude"), "sign_in": "claude auth login",
                "docs": "https://code.claude.com/docs/en/setup"},
     "codex": {"label": "ChatGPT", "app": "the Codex CLI", "plan": "a ChatGPT Plus, Pro or Business plan",
-              "install": "curl -fsSL https://chatgpt.com/codex/install.sh | sh", "sign_in": "codex login",
+              "install": _ai_install("codex"), "sign_in": "codex login",
               "docs": "https://github.com/openai/codex"},
 }
 
 
 def _package_fix(name: str) -> str:
-    return f"brew install {name}" if sys.platform == "darwin" else f"Install {name} with your package manager, e.g. sudo apt install {name}"
+    if sys.platform == "darwin":
+        return f"brew install {name}"
+    if sys.platform == "win32":
+        return f"winget install {name}"
+    return f"Install {name} with your package manager, e.g. sudo apt install {name}"
 
 
 MEDIA = {  # tool: (what it enables, how to install)

@@ -57,6 +57,9 @@ def main(argv=None):
     inst_cmd.add_argument("--dest-dir", default="/Applications", help="destination directory (default: /Applications)")
     inst_cmd.add_argument("--no-dock", action="store_true", help="do not add GameGuider.app to the macOS Dock")
     inst_cmd.add_argument("--app", metavar="PATH", help="install this prebuilt GameGuider.app instead of building one")
+    desk_cmd = sub.add_parser("install-desktop",
+                              help="add GameGuider to the Linux application menu (a .desktop entry and icon)")
+    desk_cmd.add_argument("--bin", help="the folder holding the game-guide command (default: find it on PATH)")
     search_cmd = sub.add_parser("search", help="find a boss, item or area across all your saved guides and notes")
     search_cmd.add_argument("words", nargs="+")
     search_cmd.add_argument("--spoiler", choices=SPOILERS, default="hint")
@@ -164,6 +167,9 @@ def main(argv=None):
         no_open = getattr(args, "no_open", False)
         run_web(host=host, port=port, open_browser=not no_open)
         return
+    if args.command in ("package-app", "install-app") and sys.platform != "darwin":
+        raise SystemExit("The GameGuider.app bundle is macOS-only. On Linux, use `game-guide install-desktop`; "
+                         "on Windows, the installer adds a Start Menu shortcut.")
     if args.command == "package-app":
         from . import desktop
         out_dir = Path(args.out_dir).expanduser() if args.out_dir else None
@@ -175,6 +181,11 @@ def main(argv=None):
         app_path = desktop.install_app(dest_dir=Path(args.dest_dir).expanduser(), add_to_dock=not args.no_dock,
                                        app=Path(args.app).expanduser() if args.app else None)
         print(f"Installed {app_path}")
+        return
+    if args.command == "install-desktop":
+        from . import linux_desktop
+        entry = linux_desktop.install(bin_dir=args.bin)
+        print(f"Added GameGuider to the application menu: {entry}")
         return
     if args.command == "walkthrough":
         # A walkthrough file is readable even if its game was removed from GAMES.md.

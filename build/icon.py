@@ -1,5 +1,6 @@
 # Draws the Game Guide macOS app icon and writes build/icon.icns. Run: uv run python build/icon.py
 import os
+import shutil
 import subprocess
 import tempfile
 from PIL import Image, ImageDraw
@@ -40,16 +41,21 @@ def generate_icon(out_path: str | None = None) -> str:
         x0 = 292 + i * 152
         d.rounded_rectangle((x0, 760, x0 + 136, 790), radius=15, fill=c)
 
-    out = out_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.icns")
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        iconset = os.path.join(tmp, "icon.iconset")
-        os.mkdir(iconset)
-        for size in (16, 32, 128, 256, 512):
-            for scale in (1, 2):
-                name = f"icon_{size}x{size}{'@2x' if scale == 2 else ''}.png"
-                img.resize((size * scale, size * scale), Image.LANCZOS).save(os.path.join(iconset, name))
-        subprocess.run(["/usr/bin/iconutil", "-c", "icns", iconset, "-o", out], check=True)
+    build = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(build, exist_ok=True)
+    # The portable formats: icon.png is the Linux menu entry's icon, icon.ico the Windows shortcut's.
+    img.resize((512, 512), Image.LANCZOS).save(os.path.join(build, "icon.png"))
+    img.save(os.path.join(build, "icon.ico"), format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])
+    out = out_path or os.path.join(build, "icon.icns")
+    if shutil.which("iconutil"):  # macOS: also refresh the app bundle's .icns; Linux CI needs just the PNG and ICO
+        with tempfile.TemporaryDirectory() as tmp:
+            iconset = os.path.join(tmp, "icon.iconset")
+            os.mkdir(iconset)
+            for size in (16, 32, 128, 256, 512):
+                for scale in (1, 2):
+                    name = f"icon_{size}x{size}{'@2x' if scale == 2 else ''}.png"
+                    img.resize((size * scale, size * scale), Image.LANCZOS).save(os.path.join(iconset, name))
+            subprocess.run(["/usr/bin/iconutil", "-c", "icns", iconset, "-o", out], check=True)
     return out
 
 

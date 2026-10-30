@@ -26,7 +26,15 @@ On macOS or Linux, run this in Terminal:
 curl -LsSf https://github.com/matischneider082/gameguider/releases/latest/download/install.sh | sh
 ```
 
-The installer sets up [uv](https://docs.astral.sh/uv/) if you don't have it, installs the `game-guide` command (with its own Python, in `~/.local`) and the `yt-dlp` video downloader, and on macOS installs **GameGuider.app** in `~/Applications` and adds it to the Dock. Set `GAMEGUIDER_NO_DOCK=1` to leave the Dock alone. It doesn't need administrator rights.
+The installer sets up [uv](https://docs.astral.sh/uv/) if you don't have it, installs the `game-guide` command (with its own Python, in `~/.local`) and the `yt-dlp` video downloader; on macOS it installs **GameGuider.app** in `~/Applications` and adds it to the Dock (`GAMEGUIDER_NO_DOCK=1` leaves the Dock alone), and on Linux it adds GameGuider to your application menu. It doesn't need administrator rights.
+
+On Windows 10/11, run this in PowerShell instead:
+
+```powershell
+irm https://github.com/matischneider082/gameguider/releases/latest/download/install.ps1 | iex
+```
+
+It installs the same `game-guide` command, `yt-dlp` and uv, plus a **GameGuider** shortcut in the Start Menu that opens the Web UI.
 
 ### Connect your AI
 
@@ -41,19 +49,17 @@ The installer finishes by walking you through it: pick your AI, and it runs that
 
 - **In the app:** select **Setup** in the sidebar (it opens by itself on first launch when no AI is connected). Pick your AI, then follow the two steps; each has **Copy** and, on macOS, **Run in Terminal**. Select **Check again** when you're done.
 - **In a terminal:** run `game-guide setup` (add `--connect` to switch AIs).
-- **By hand:** install Claude Code with `curl -fsSL https://claude.ai/install.sh | bash` and sign in with `claude auth login`, or install the Codex CLI with `curl -fsSL https://chatgpt.com/codex/install.sh | sh` and sign in with `codex login`.
+- **By hand:** install Claude Code with `curl -fsSL https://claude.ai/install.sh | bash` and sign in with `claude auth login`, or install the Codex CLI with `curl -fsSL https://chatgpt.com/codex/install.sh | sh` and sign in with `codex login`. On Windows: `powershell -c "irm https://claude.ai/install.ps1 | iex"` and `npm install -g @openai/codex`.
 
 GameGuider only asks each app whether it's signed in; it never reads your account details or login tokens.
 
-Video playback and still frames also need `ffmpeg` (`brew install ffmpeg` on macOS), and an external player needs `mpv`; without them, videos open on YouTube. The shelf, notes, search and saved walkthroughs work without any of these.
+Video playback and still frames also need `ffmpeg` (`brew install ffmpeg` on macOS, `sudo apt install ffmpeg` on Debian/Ubuntu, `winget install ffmpeg` on Windows), and an external player needs `mpv`; without them, videos open on YouTube. The shelf, notes, search and saved walkthroughs work without any of these.
 
-**Requirements:** macOS 13 or later (Apple silicon or Intel), or Linux, for the installer. Run `game-guide setup` at any time to check this machine; in the app, use **Setup** in the sidebar.
+**Requirements:** macOS 13 or later (Apple silicon or Intel), Linux with a current desktop environment, or Windows 10/11. Run `game-guide setup` at any time to check this machine; in the app, use **Setup** in the sidebar.
 
 **Updating:** run the install command again. **Check for updates** in the sidebar tells you when a newer release exists.
 
-**Uninstalling:** `uv tool uninstall game-guide`, then delete `~/Applications/GameGuider.app`. Your notes folder is left alone.
-
-**Windows:** not supported natively (GameGuider stops AI and video processes with POSIX process groups). Under [WSL](https://learn.microsoft.com/windows/wsl/install), run the install command in your Linux shell, then `game-guide web` and open the printed address in your Windows browser.
+**Uninstalling:** `uv tool uninstall game-guide`, then delete `~/Applications/GameGuider.app` on macOS; on Linux, delete `~/.local/share/applications/gameguider.desktop` and `~/.local/share/icons/hicolor/512x512/apps/gameguider.png`; on Windows, remove the Start Menu shortcut and `%LOCALAPPDATA%\GameGuider`. Your notes folder is left alone.
 
 If you download `GameGuider-macOS.zip` from the release page in a browser instead of using the installer, macOS quarantines it because the app is not notarized. Install the command first (the installer does this), then run `xattr -dr com.apple.quarantine GameGuider.app` once before opening the app.
 
@@ -119,8 +125,9 @@ brew install ffmpeg mpv   # still frames and video playback
 game-guide setup                   # check what's installed and what's missing, with the fix for each
 game-guide setup --notes-dir ~/Obsidian/Games   # keep your notes somewhere else
 game-guide web                     # open the local browser Web UI (walkthroughs, images & video)
-game-guide install-app             # build GameGuider.app, install to /Applications, and pin to the Dock
-game-guide package-app             # build out/GameGuider.app bundle
+game-guide install-app             # build GameGuider.app, install to /Applications, and pin to the Dock (macOS)
+game-guide install-desktop         # add GameGuider to the Linux application menu
+game-guide package-app             # build out/GameGuider.app bundle (macOS)
 game-guide                         # TUI (press `o` inside to open the Web UI)
 game-guide list
 game-guide backlog                         # list your Backlog in queue order
@@ -192,7 +199,7 @@ The wheel includes the plugin, its scripts, and the app icon. GitHub Actions run
 2. Check the app locally: `uv run game-guide package-app`, then `GAME_GUIDE_APP_SMOKE=1 GAME_GUIDE_DIR=$(mktemp -d) ./out/GameGuider.app/Contents/MacOS/GameGuider` must print `SMOKE_OK`.
 3. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 
-The `Release` workflow then runs the tests, builds the wheel and source archive, builds the universal macOS app on a macOS runner, stamps `install.sh` with the version, and publishes a GitHub release with all four files. The one-line installer always downloads the latest release.
+The `Release` workflow then runs the tests (on Linux and Windows), builds the wheel and source archive, builds the universal macOS app on a macOS runner, stamps `install.sh` and `install.ps1` with the version, and publishes a GitHub release with all of the files. The one-line installers always download the latest release.
 
 ## Develop
 

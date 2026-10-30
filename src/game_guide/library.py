@@ -160,6 +160,12 @@ def save_game(
             if g.slug in (target_slug, new_slug) or g.name.lower() == clean_name.lower():
                 matched = g
                 break
+        if lookup_slug is not None and matched is not None:
+            # An explicit update names one game; a rename that lands on another game's row would
+            # overwrite it or leave two rows sharing one slug, so reject before touching anything.
+            others = [g for g in existing if g is not matched and (g.slug == new_slug or g.name.lower() == clean_name.lower())]
+            if matched.slug != target_slug or others:
+                raise ValueError(f"Another game already uses the name '{clean_name}'.")
 
         stamp = _clean_cell(updated) if updated else today_iso()
         if matched is not None:

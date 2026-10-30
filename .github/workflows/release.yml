@@ -1,7 +1,8 @@
 name: Release
 
 # Push a tag such as v0.2.0 (matching pyproject.toml's version) to publish a GitHub release with the Python wheel,
-# the prebuilt macOS app, and install.sh stamped with that version, which is what the one-line installer downloads.
+# the prebuilt macOS app, and install.sh / install.ps1 stamped with that version, which is what the one-line
+# installers download (along with the icon files the Linux menu entry and Windows shortcut use).
 on:
   push:
     tags: ['v*']
@@ -61,8 +62,11 @@ jobs:
         with:
           path: assets
           merge-multiple: true
-      - name: Stamp the installer with this version
-        run: sed "s/__VERSION__/${GITHUB_REF_NAME#v}/" install.sh > assets/install.sh
+      - name: Stamp the installers with this version
+        run: |
+          sed "s/__VERSION__/${GITHUB_REF_NAME#v}/" install.sh > assets/install.sh
+          sed "s/__VERSION__/${GITHUB_REF_NAME#v}/" install.ps1 > assets/install.ps1
+          cp build/icon.png build/icon.ico assets/
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -40,6 +40,7 @@ def run_script(name, *args, env=None):
     return subprocess.run([sys.executable, SCRIPTS / name, *args], capture_output=True, text=True, env=env)
 
 
+@unittest.skipUnless(os.name == "posix", "asserts the POSIX grammar of claude's permission rules")
 class ClaudeAllowlist(unittest.TestCase):
     def test_no_broad_rules(self):
         cmd = backends.claude_command("q", None, Path("/n"))
@@ -68,7 +69,8 @@ class CodexSandbox(unittest.TestCase):
         profile = next(a for a in cmd if a.startswith("permissions.game-guide.filesystem="))
         self.assertIn('":minimal"="read"', profile)
         self.assertIn('":workspace_roots"="write"', profile)
-        self.assertIn(f'"{backends.SKILL.parent}"="read"', profile)
+        # The profile is TOML, so backslashes in Windows paths arrive doubled; POSIX paths are unchanged.
+        self.assertIn(f'"{backends.SKILL.parent}"="read"'.replace("\\", "\\\\"), profile)
         self.assertIn('default_permissions="game-guide"', cmd)
         for feature in ("apps", "plugins", "hooks", "browser_use", "computer_use"):
             self.assertIn(["--disable", feature], [cmd[i:i + 2] for i in range(len(cmd))])
@@ -87,7 +89,7 @@ class CodexSandbox(unittest.TestCase):
         self.assertIn(["--disable", "memories"], [cmd[i:i + 2] for i in range(len(cmd))])
         profile = next(a for a in cmd if a.startswith("permissions.game-guide.filesystem="))
         for name in ("AGENTS.md", ".agents", ".codex", "CLAUDE.md"):
-            self.assertIn(f'"{backends.games_dir().resolve() / name}"="read"', profile)
+            self.assertIn(f'"{backends.games_dir().resolve() / name}"="read"'.replace("\\", "\\\\"), profile)
 
     def test_fails_closed_when_servers_cannot_be_switched_off(self):
         for config in ("not toml [", '[mcp_servers."a.b"]\ncommand = "x"\n'):
@@ -122,6 +124,7 @@ class Planted(unittest.TestCase):
         self.assertIn(f"Edit(/{notes}/.mcp.json)", denied)
 
 
+@unittest.skipUnless(os.name == "posix", "the fake yt-dlp is a shebang script on PATH")
 class Captions(unittest.TestCase):
     def setUp(self):
         self.bin = temp_dir(self)
