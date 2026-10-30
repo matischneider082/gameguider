@@ -1,0 +1,11 @@
+{
+  "name": "game-guide",
+  "owner": { "name": "GameGuider" },
+  "plugins": [
+    {
+      "name": "game-guide",
+      "source": "./",
+      "description": "Track the games you're playing and get spoiler-aware guides."
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+name: Test and package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install project and build tools
+        run: python -m pip install . build 'uv==0.12.21'
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Build distributions
+        run: python -m build
+      - name: Verify installed wheel includes the plugin
+        shell: bash
+        run: |
+          python -m pip install --no-deps --target "$RUNNER_TEMP/gameguider-wheel" dist/*.whl
+          cd "$RUNNER_TEMP"
+          GAME_GUIDE_DIR="$RUNNER_TEMP/gameguider-notes" PYTHONPATH="$RUNNER_TEMP/gameguider-wheel" python -c 'from game_guide.backends import PLUGIN_ROOT, SKILL, skill_prompt; assert SKILL.is_file(); assert (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").is_file(); assert (SKILL.parent / "scripts" / "fetch_text_guide.py").is_file(); assert (PLUGIN_ROOT / "build" / "icon.icns").is_file(); assert "Example question" in skill_prompt("Example question")'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gameguider-python-distributions
+          path: dist/*
+          if-no-files-found: error

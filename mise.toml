@@ -1,0 +1,65 @@
+[tools]
+python = "3.13"
+uv = "latest"
+yt-dlp = "latest"
+# ffmpeg and mpv have no prebuilt mise backend on macOS; install them with `brew install ffmpeg mpv`.
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.setup]
+description = "Install Python deps into .venv"
+run = "uv sync"
+
+[tasks.tui]
+description = "Open the TUI"
+run = "uv run game-guide"
+
+[tasks.web]
+description = "Open the local browser Web UI"
+run = "uv run game-guide web"
+
+[tasks.package]
+description = "Build out/GameGuider.app"
+run = "uv run game-guide package-app"
+
+[tasks.install-app]
+description = "Build GameGuider.app, install to /Applications, and pin to the Dock"
+run = "uv run game-guide install-app"
+
+[tasks.test]
+description = "Run the tests"
+run = "uv run python -m unittest discover -s tests -v"
+
+[tasks.install]
+description = "Put the game-guide command on PATH (editable, so it finds the skill in this repo)"
+run = "uv tool install --editable --force ."
+
+[tasks.plugin]
+description = "Register this repo as a local Claude Code marketplace and install the plugin"
+run = [
+  "claude plugin marketplace add {{config_root}}",
+  "claude plugin install game-guide@game-guide",
+  # Both commands above exit 0 when already present ("already installed"), so re-running is safe; this catches a silent miss.
+  "claude plugin list | grep -q game-guide@game-guide",
+]
+
+[tasks.bootstrap]
+description = "One-command setup: deps, game-guide on PATH, Claude plugin, then report missing optional tools"
+run = [
+  # The marketplace and the editable install are global, so a worktree run would re-point them at the worktree.
+  "case '{{config_root}}' in */worktrees/*) echo 'run bootstrap from the main checkout, not a worktree' >&2; exit 1;; esac",
+  "mise run setup",
+  "mise run install",
+  "mise run plugin",
+  '''
+  for t in yt-dlp ffmpeg mpv uv claude codex; do
+    command -v $t >/dev/null || case $t in
+      yt-dlp|uv) echo "missing: $t  ->  mise use -g yt-dlp uv" ;;
+      ffmpeg|mpv) echo "missing: $t  ->  brew install ffmpeg mpv" ;;
+      *) echo "missing: $t  ->  install the $t CLI (https://docs.claude.com/claude-code for claude, https://github.com/openai/codex for codex)" ;;
+    esac
+  done
+  echo "optional-tools check done"
+  ''',
+]
