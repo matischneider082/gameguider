@@ -13,8 +13,8 @@ jobs:
   python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Check the tag matches the package version
@@ -27,7 +27,7 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Build distributions
         run: python -m build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python
           path: dist/*
@@ -36,8 +36,8 @@ jobs:
   macos-app:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Build the universal app
@@ -46,7 +46,7 @@ jobs:
           game-guide package-app --out-dir out
           lipo -archs out/GameGuider.app/Contents/MacOS/GameGuider
           ditto -c -k --keepParent out/GameGuider.app GameGuider-macOS.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-app
           path: GameGuider-macOS.zip
@@ -56,8 +56,8 @@ jobs:
     needs: [python, macos-app]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: assets
           merge-multiple: true
