@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from game_guide import library
+from game_guide import library, notes
 from game_guide.notes import Game
 
 GAMES = """# Games
@@ -51,6 +51,71 @@ class ReadAndFind(LibraryTests):
 
     def test_find_game_returns_none_for_an_unknown_key(self):
         self.assertIsNone(library.find_game("Hades II", self.dir))
+
+
+class PartialFiles(LibraryTests):
+    def test_a_truncated_index_still_lists_the_intact_rows(self):
+        # The last row is a cut-off UTF-8 sequence from an editor saving in place.
+        (self.dir / "GAMES.md").write_bytes(
+            b"# Games\n\n"
+            b"| Game | Platform | Genre | Status | Spot | Updated |\n"
+            b"|---|---|---|---|---|---|\n"
+            b"| Celeste | PC | platform | Playing | Summit | 2026-10-01 |\n"
+            b"| Caf\xc3"
+        )
+        games = library.read_games(self.dir)
+        self.assertEqual(games[0].name, "Celeste")
+        self.assertEqual(games[0].spot, "Summit")
+
+    def test_notes_that_are_partial_or_unreadable_do_not_crash_a_selected_game(self):
+        game = library.save_game("Celeste", directory=self.dir)
+        path = notes.notes_path(game, self.dir)
+        path.write_bytes(b"## Summit\nCaf\xc3")
+        text = notes.read_notes(game, self.dir)
+        self.assertIn("Summit", text)
+        if os.name != "posix":
+            return  # chmod 0 does not make a file unreadable on Windows
+        path.write_text("secret", encoding="utf-8")
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o644)
+        self.assertEqual(notes.read_notes(game, self.dir), "")
+        self.assertEqual(notes.read_walkthrough(game, self.dir), "")
+
+    def test_a_note_can_be_appended_when_the_file_was_saved_mid_character(self):
+        game = library.save_game("Celeste", directory=self.dir)
+        notes.notes_path(game, self.dir).write_bytes(b"## Summit\nCaf\xc3")
+        library.append_note(game, "Reached the top.", heading="Summit", directory=self.dir)
+        text = notes.notes_path(game, self.dir).read_text(encoding="utf-8", errors="replace")
+        self.assertIn("Reached the top.", text)
+
+
+class SlugCollisions(LibraryTests):
+    def test_titles_with_no_ascii_letters_do_not_overwrite_each_other(self):
+        for name in ("ゼルダ", "ポケモン", "???", "!!!"):
+            library.save_game(name, directory=self.dir)
+        games = library.read_games(self.dir)
+        self.assertEqual([g.name for g in games], ["ゼルダ", "ポケモン", "???", "!!!"])
+        self.assertEqual(len({g.slug for g in games}), 4)
+        # Accent folding stays the slug the model is told to write.
+        self.assertEqual(notes.slugify("Pokémon Scarlet"), "pokemon-scarlet")
+        self.assertEqual(len({p.name for p in self.dir.glob("*.md")} - {"GAMES.md"}), 4)
+
+
+class FoldedFilenames(LibraryTests):
+    def test_a_walkthrough_whose_filename_folds_onto_a_game_is_not_a_second_game(self):
+        library.save_game("Pokemon", directory=self.dir)
+        (self.dir / "Pokémon.walkthrough.md").write_text(
+            "# Pokémon — Walkthrough\n\n## Pallet\nHi\n", encoding="utf-8")
+        games = library.discover_games(self.dir)
+        self.assertEqual([(g.name, g.slug) for g in games], [("Pokemon", "pokemon")])
+        self.assertIn("Pallet", notes.read_walkthrough(games[0], self.dir))
+
+    def test_notes_saved_under_a_folded_filename_still_open(self):
+        game = library.save_game("Pokemon", directory=self.dir)
+        path = notes.notes_path(game, self.dir)
+        path.write_text("from the accented file", encoding="utf-8")
+        path.rename(self.dir / "Pokémon.md")
+        self.assertIn("accented", notes.read_notes(game, self.dir))
 
 
 class Writes(LibraryTests):

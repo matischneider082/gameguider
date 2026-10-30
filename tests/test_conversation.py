@@ -60,8 +60,72 @@ class Sessions(unittest.TestCase):
         self.assertEqual(closed, [True])
         self.assertEqual(conversation.sessions, {})
 
+    def test_reset_does_not_drop_a_session_stored_by_a_later_question(self):
+        conversation = Conversation()
+        asked = {"done": False}
+
+        def on_release():
+            # reset() used to clear sessions after releasing the lock, so a question that
+            # started in that window stored a session and then lost it.
+            if asked["done"]:
+                return
+            asked["done"] = True
+            list(conversation.ask("claude", "later", "hint"))
+
+        conversation._lock = HookLock(on_release)
+
+        def fake(backend, question, session=None):
+            yield Event("session", session="new")
+            yield Event("done", "ok", "new")
+
+        with patch_ask(fake):
+            conversation.reset()
+        self.assertEqual(conversation.sessions.get("claude"), "new")
+
+
+class HookLock:
+    """A lock that runs `on_release` after each release, so a test can step into a race window."""
+
+    def __init__(self, on_release):
+        self._lock = threading.Lock()
+        self._on_release = on_release
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        self._lock.release()
+        self._on_release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
 
 class Superseding(unittest.TestCase):
+    def test_a_question_cancelled_before_it_starts_does_not_run_the_cli(self):
+        conversation = Conversation()
+        started = []
+        releases = {"n": 0}
+
+        def on_release():
+            releases["n"] += 1
+            if releases["n"] == 1:  # the token was just taken; cancel before the CLI is registered
+                conversation.cancel()
+
+        conversation._lock = HookLock(on_release)
+
+        def fake(backend, question, session=None):
+            started.append(question)
+            yield Event("done", "should not run")
+
+        with patch_ask(fake):
+            self.assertEqual(list(conversation.ask("claude", "q", "hint")), [])
+        self.assertEqual(started, [])
+
     def test_a_newer_question_closes_an_idle_older_one(self):
         closed = []
 

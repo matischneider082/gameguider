@@ -86,7 +86,7 @@ Spoiler filtering applies to sections labelled Hint, Strategy, and Answer; other
 
 ## Checking for updates
 
-In GameGuider, select **Check for updates** in the sidebar. It doesn't download or install anything.
+GameGuider checks once each time it opens and shows a notice in the sidebar when a newer version exists; it stays silent otherwise, including when the check fails. You can also select **Check for updates** in the sidebar at any time. The check never downloads or installs anything. For an installed copy, a notice offers **Update now**, which runs the same installer as below and asks you to reopen GameGuider afterwards; a source checkout updates with git.
 
 - **Installed with the installer (or from a wheel):** the check compares your version with the latest GitHub release. To update, run the install command again and reopen the app.
 - **A source checkout:** the check compares it with the `main` branch on GitHub. For a clean checkout of `main`, quit GameGuider and run the following from the repository directory, then reopen the app:
@@ -148,6 +148,8 @@ In the Web UI, search your library by title, platform, or genre and filter it by
 
 In the Web UI, use **Backlog List** to paste bulleted, numbered, or plain multiline lists. Select the **Backlog** filter and use the arrow buttons to reorder the queue. Each line accepts `Game | Platform | Genre | Notes`; default platform and genre are optional, and cover fetching can be enabled for the whole batch.
 
+In the Web UI, select **Progress** in the sidebar to see how many games are in each status, the backlog in queue order, notes and walkthroughs changed recently, and how far you are in each saved walkthrough — read from your notes folder on this machine.
+
 In the Web UI, **Setup** in the sidebar shows the same checks and lets you change the notes folder and the **Theme**: Match system (dark or light, following your Mac or PC), Dark, Light, or High contrast. The theme applies at once and is saved in `~/.config/game-guide/config.json`. A banner on the shelf appears when GameGuider can't research guides yet, for example when neither the Claude nor the Codex CLI is installed.
 
 In Claude Code, say "I just started Elden Ring on PS5", or run `/game-guide:game-guide how do I beat Malenia`.
@@ -159,6 +161,8 @@ In Claude Code, say "I just started Elden Ring on PS5", or run `/game-guide:game
 | ↑/↓ in the games list | switch game |
 | Enter in the question box | ask, using the spoiler level and backend chosen next to it |
 | `w` | build the selected game's full walkthrough (or rebuild it) |
+| `c` | fetch or refresh the selected game's critic score (when the question box isn't focused) |
+| `ctrl+g` | fetch or refresh that score, including while the question box is focused |
 | `o` | open the local browser Web UI for the current game |
 | ↑/↓ and Enter (Walkthrough tab) | page through the chapters; Enter starts a question about the chapter. ● marks the chapter with your current spot |
 | `ctrl+t` | next tab |
@@ -167,6 +171,8 @@ In Claude Code, say "I just started Elden Ring on PS5", or run `/game-guide:game
 | `r` | reload the notes |
 | `ctrl+n` | start a new conversation (stops a question that is still running, like **New Chat** in the Web UI) |
 | `ctrl+q` | quit |
+
+The selected game's critic score is shown above the tabs, and as a number out of 100 beside its name in the list once one is saved. `c` and `ctrl+g` fetch or refresh it from OpenCritic or Metacritic through Wikidata, or from IGDB when that is configured. The fetch does not need Claude or Codex. Letter keys such as `c` and `w` run when the question box isn't focused; `ctrl+g` works from that box too.
 
 YouTube refuses ffmpeg and mpv reading its streams directly (403), and embedding YouTube in a browser serves ads. So the first play or frame extraction on a video downloads it in full at 720p or less via `yt-dlp` into `~/.cache/game-guide`, and the Web UI streams it directly to the `<video>` element with HTTP Range seeking and zero ads. After that, frames and replays are instant. Nothing clears that cache automatically.
 

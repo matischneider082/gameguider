@@ -223,9 +223,10 @@ class TextGuideLimits(unittest.TestCase):
     def test_caps_body_size_and_total_time(self):
         out = in_script_env(TEXT, """
 m.check_public_url = lambda url: None
-m.MAX_BYTES, m.DEADLINE_SECONDS = 1000, 0.5
+m.MAX_BYTES = 1000
 errors = []
-for path in ("/big", "/slow"):
+# /big gets a generous deadline so a slow runner (Windows CI) reaches the size cap; only /slow is meant to time out.
+for path, m.DEADLINE_SECONDS in (("/big", 10), ("/slow", 0.5)):
     try:
         m.fetch_html(sys.argv[2] + path)
         errors.append("fetched")

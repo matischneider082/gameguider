@@ -84,6 +84,20 @@ class Ask(unittest.TestCase):
         os.kill(grandchild, 9)
         self.fail("grandchild survived")
 
+    def test_a_cli_killed_mid_write_does_not_crash_the_turn(self):
+        # A byte that is not valid UTF-8, as when the process is killed mid-character.
+        # The line before it is a real answer and must still come through.
+        script = (
+            'import json, sys\n'
+            'sys.stdout.buffer.write(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "kept"}}).encode() + b"\\n")\n'
+            'sys.stdout.buffer.write(json.dumps({"type": "turn.completed"}).encode() + b"\\n")\n'
+            'sys.stdout.buffer.write(b"\\xc3")\n'
+            'sys.stdout.buffer.flush()\n'
+        )
+        with fake_cli("codex", script):
+            got = [(e.kind, e.text) for e in backends.ask("codex", "q")]
+        self.assertIn(("done", "kept"), got)
+
     def test_the_cli_gets_no_stdin(self):
         script = ('import json, sys\n'
                   'print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": repr(sys.stdin.read())}}))\n')
@@ -182,6 +196,30 @@ class Download(unittest.TestCase):
 
 
 class ProcsTreeKill(unittest.TestCase):
+    def test_a_timed_out_command_is_killed_when_sigkill_does_not_exist(self):
+        """Windows has no signal.SIGKILL; the timeout path must still taskkill the tree."""
+        import signal
+
+        from game_guide import procs
+        had, saved = hasattr(signal, "SIGKILL"), getattr(signal, "SIGKILL", None)
+        if had:
+            delattr(signal, "SIGKILL")
+        proc = mock.Mock()
+        proc.pid = 99
+        proc.__enter__ = mock.Mock(return_value=proc)
+        proc.__exit__ = mock.Mock(return_value=False)
+        proc.communicate.side_effect = [subprocess.TimeoutExpired(["sleep", "30"], 1), ("", "")]
+        try:
+            with mock.patch.object(procs, "start", return_value=proc), \
+                    mock.patch.object(procs, "WIN", True), \
+                    mock.patch.object(procs.subprocess, "run") as taskkill:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    procs.run(["sleep", "30"], timeout=1)
+            self.assertEqual(taskkill.call_args.args[0][:4], ["taskkill", "/PID", "99", "/T"])
+        finally:
+            if had:
+                setattr(signal, "SIGKILL", saved)
+
     def test_kill_tree_reaches_a_process_with_children_of_its_own(self):
         """The tree kill really ends a process that has children, on this platform."""
         from game_guide import procs

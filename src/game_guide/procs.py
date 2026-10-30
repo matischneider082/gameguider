@@ -38,11 +38,17 @@ def worker_cancelled():
         return False
 
 
-def kill_tree(pid, sig=signal.SIGTERM):
-    """Kill a process and everything it spawned (POSIX: the process group; Windows: `taskkill /T`)."""
+def kill_tree(pid, sig=None, *, force=False):
+    """Kill a process and everything it spawned (POSIX: the process group; Windows: `taskkill /T`).
+
+    `force` is the second step after SIGTERM is ignored. It must not look up `signal.SIGKILL` on Windows,
+    where that name does not exist; `taskkill /F` is already a force kill.
+    """
     if WIN:
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
         return
+    if sig is None:
+        sig = signal.SIGKILL if force else signal.SIGTERM
     try:
         os.killpg(pid, sig)
     except (ProcessLookupError, PermissionError):  # macOS: EPERM when the group is only an unreaped zombie
@@ -63,7 +69,7 @@ def run(cmd, timeout):
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            kill_tree(proc.pid, signal.SIGKILL)
+            kill_tree(proc.pid, force=True)
             proc.communicate()
             raise
         finally:

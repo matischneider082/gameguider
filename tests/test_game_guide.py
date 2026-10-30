@@ -1,7 +1,10 @@
+import asyncio
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -223,6 +226,136 @@ class Tui(unittest.IsolatedAsyncioTestCase):
                     await app.workers.wait_for_complete()
                     await pilot.pause()
                     self.assertEqual(len(app.query_one("#frames").children), 2)
+
+    async def test_cached_critic_score_shows_on_the_header_and_in_the_list(self):
+        from textual.widgets import ListView
+
+        from game_guide import scores
+        from game_guide.app import GameGuide
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"GAME_GUIDE_DIR": d}):
+            Path(d, "GAMES.md").write_text(GAMES)
+            Path(d, scores.CACHE_NAME).write_text(json.dumps({
+                "elden-ring": {"name": "Elden Ring", "score": 93.2, "count": 11, "source": "IGDB"},
+            }))
+            app = GameGuide()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                self.assertEqual(app.query_one("#critic").content, "Critics 93/100 · IGDB (11)")
+                labels = [str(label.content) for label in app.query("#games Label")]
+                self.assertIn("93/100", labels[0])
+                self.assertNotIn("/100", labels[1])
+                # The header row must not let the notes pane grow past the window.
+                main = app.query_one("#main")
+                self.assertLessEqual(main.region.right, 120)
+                self.assertGreater(main.region.width, 60)
+                app.query_one("#games", ListView).index = 1
+                await pilot.pause()
+                self.assertEqual(app.game.name, "Hollow Knight: Silksong")
+                self.assertEqual(app.query_one("#critic").content, "No critic score yet. ctrl+g fetches one.")
+
+    async def test_ctrl_g_fetches_a_critic_score_while_the_question_box_is_focused(self):
+        from game_guide import scores
+        from game_guide.app import GameGuide
+        started, release = threading.Event(), threading.Event()
+
+        seen = {}
+
+        def fake(game, directory):
+            seen["directory"] = Path(directory)
+            started.set()
+            release.wait(5)
+            result = {"score": 89, "count": 72, "source": "OpenCritic"}
+            Path(directory, scores.CACHE_NAME).write_text(json.dumps(
+                {game.slug: {"name": game.name, **result}}))
+            return result
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"GAME_GUIDE_DIR": d}), \
+                mock.patch("game_guide.scores.refresh_score", fake), \
+                mock.patch("game_guide.doctor.ai_status", side_effect=AssertionError("scores must not ask the AI")):
+            Path(d, "GAMES.md").write_text(GAMES)
+            app = GameGuide()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertIs(app.focused, app.query_one("#question"))
+                await pilot.press("ctrl+g")
+                self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                await pilot.pause()
+                self.assertEqual(app.query_one("#status").content, "Fetching critic score for Elden Ring…")
+                release.set()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(app.query_one("#critic").content, "Critics 89/100 · OpenCritic (72)")
+                self.assertEqual(app.query_one("#status").content, "Critics 89/100 · OpenCritic (72)")
+                self.assertIn("89/100", str(app.query("#games Label")[0].content))
+                self.assertEqual(seen["directory"], Path(d))
+
+    async def test_c_fetches_a_critic_score_from_the_walkthrough_tab(self):
+        from game_guide import scores
+        from game_guide.app import GameGuide
+
+        def fake(game, directory):
+            result = {"score": 91, "count": None, "source": "Metacritic"}
+            Path(directory, scores.CACHE_NAME).write_text(json.dumps(
+                {game.slug: {"name": game.name, "score": 91, "count": None, "source": "Metacritic"}}))
+            return result
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"GAME_GUIDE_DIR": d}), \
+                mock.patch("game_guide.scores.refresh_score", fake):
+            Path(d, "GAMES.md").write_text(GAMES)
+            app = GameGuide()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.query_one("#main").active = "walk-tab"
+                await pilot.pause()
+                await pilot.press("c")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(app.query_one("#critic").content, "Critics 91/100 · Metacritic")
+                self.assertIn("91/100", str(app.query("#games Label")[0].content))
+
+    async def test_a_failed_critic_fetch_keeps_the_saved_score(self):
+        from game_guide import scores
+        from game_guide.app import SCORE_FAILED, GameGuide
+        failures = iter([
+            ValueError("ERROR: [wikidata] no critic score for this game yet."),
+            RuntimeError("boom"),
+        ])
+
+        def fake(game, directory):
+            raise next(failures)
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"GAME_GUIDE_DIR": d}), \
+                mock.patch("game_guide.scores.refresh_score", fake):
+            Path(d, "GAMES.md").write_text(GAMES)
+            Path(d, scores.CACHE_NAME).write_text(json.dumps({
+                "elden-ring": {"name": "Elden Ring", "score": 90, "count": 4, "source": "Metacritic"},
+            }))
+            app = GameGuide()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertEqual(app.query_one("#critic").content, "Critics 90/100 · Metacritic (4)")
+                await pilot.press("ctrl+g")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(app.query_one("#status").content, "ERROR: [wikidata] no critic score for this game yet.")
+                self.assertEqual(app.query_one("#critic").content, "Critics 90/100 · Metacritic (4)")
+                await pilot.press("ctrl+g")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                self.assertEqual(app.query_one("#status").content, SCORE_FAILED)
+                self.assertIn("90/100", str(app.query("#games Label")[0].content))
+                self.assertIsNotNone(app.query_one("#critic"))  # the app is still up
+
+    async def test_critic_score_without_a_game_asks_you_to_pick_one(self):
+        from game_guide.app import GameGuide
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"GAME_GUIDE_DIR": d}):
+            app = GameGuide()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+g")
+                await pilot.pause()
+                self.assertTrue(any(n.message == "Pick or add a game first." for n in app._notifications))
+                self.assertEqual(app.query_one("#critic").content, "")
 
 
 class Script(unittest.TestCase):

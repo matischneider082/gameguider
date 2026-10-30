@@ -22,12 +22,18 @@ from .notes import Video, games_dir
 from .render import render
 
 # path -> action(query or body): its return value is the 200 JSON response
-GET_ACTIONS = {"/api/state": actions.state, "/api/setup": actions.setup, "/api/search": actions.search}
+GET_ACTIONS = {
+    "/api/state": actions.state,
+    "/api/setup": actions.setup,
+    "/api/search": actions.search,
+    "/api/progress": actions.overview,
+}
 POST_ACTIONS = {
     "/api/setup": actions.save_setup,
     "/api/setup/terminal": actions.setup_terminal,
     "/api/theme": actions.save_theme,
     "/api/updates/check": actions.check_updates,
+    "/api/updates/install": actions.install_update,
     "/api/games/artwork": actions.refresh_artwork,
     "/api/scores/refresh": actions.refresh_score,
     "/api/backlog": actions.add_backlog,
@@ -81,7 +87,19 @@ class GuideRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_file_range(self, path: Path, content_type: str):
-        size = path.stat().st_size
+        try:
+            file = path.open("rb")
+        except OSError:
+            raise ActionError(404, "Video not found") from None
+        with file:
+            self._send_open_file_range(file, content_type)
+
+    def _send_open_file_range(self, file, content_type: str):
+        try:
+            size = file.seek(0, 2)
+            file.seek(0)
+        except OSError:
+            raise ActionError(404, "Video not found") from None
         range_header = self.headers.get("Range")
         start, end = 0, size - 1
         status = 200
@@ -107,7 +125,9 @@ class GuideRequestHandler(BaseHTTPRequestHandler):
                         self.end_headers()
                         return
                 except ValueError:
-                    pass
+                    # `bytes=2-nope` parses the start before the end fails. Leaving that start in place
+                    # answered 200 with a short body and no Content-Range, which a player treats as the whole file.
+                    start, end = 0, size - 1
 
         length = max(0, end - start + 1) if size > 0 else 0
         self.send_response(status)
@@ -120,28 +140,52 @@ class GuideRequestHandler(BaseHTTPRequestHandler):
 
         if length <= 0:
             return
-        with path.open("rb") as f:
-            f.seek(start)
+        try:
+            file.seek(start)
             remaining = length
             while remaining > 0:
-                chunk = f.read(min(65536, remaining))
+                chunk = file.read(min(65536, remaining))
                 if not chunk:
+                    # The file shrank after we promised Content-Length. Close so the next request
+                    # is not read as the rest of this body.
+                    self.close_connection = True
                     break
                 try:
                     self.wfile.write(chunk)
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 remaining -= len(chunk)
+        except OSError:
+            self.close_connection = True
 
     def _read_json_body(self) -> dict | None:
-        try:
-            length = int(self.headers.get("Content-Length") or "0")
-        except ValueError:
-            return None
-        if length <= 0 or length > 1_000_000:
+        """The JSON object, or None when the body is not one. Sets `_body_error` to (status, message) when the
+        length itself is unusable: a negative or huge Content-Length is not an empty object, and leaving those
+        bytes unread would make the next keep-alive request start mid-body."""
+        self._body_error = None
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
             return {}
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            length = int(raw_length)
+        except ValueError:
+            self.close_connection = True
+            return None
+        if length < 0:
+            self.close_connection = True
+            return None
+        if length > 1_000_000:
+            self.close_connection = True
+            self._body_error = (413, "Request body is too large")
+            return None
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            self.close_connection = True
+            return None
+        try:
+            body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return None
         return body if isinstance(body, dict) else None
@@ -173,11 +217,17 @@ class GuideRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if reason := self._foreign(post=True):
             self.close_connection = True  # the unread body would otherwise be parsed as the next request
+            try:
+                self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65_536))  # discarded, never parsed
+            except (ValueError, OSError):
+                pass
+            # Closing with the body unread makes Windows reset the connection before the client reads the 403.
             self._send_json(403, {"error": reason})
             return
         body = self._read_json_body()
         if body is None:
-            self._send_json(400, {"error": "Invalid JSON body"})
+            status, message = self._body_error or (400, "Invalid JSON body")
+            self._send_json(status, {"error": message})
             return
         self._route(urllib.parse.urlparse(self.path).path, body, POST_ACTIONS, self.POST_ROUTES, {})
 
@@ -466,6 +516,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .update-panel { padding: 0 12px 10px; border-bottom: 1px solid var(--border); }
   .update-panel { display: flex; flex-wrap: wrap; gap: 6px; }
   .update-panel button { flex: 1; }
+  .update-panel button[hidden] { display: none; }
+  #modal-more > summary { cursor: pointer; color: var(--text-secondary); font-size: 13px; }
+  #modal-more[open] > summary { margin-bottom: 12px; }
   .update-panel .update-result { flex-basis: 100%; }
   .guide-hits h2 { margin:28px 0 10px; font-size:16px; }
   .guide-hits p { color:var(--text-secondary); font-size:14px; }
@@ -908,10 +961,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .segmented button:hover {
     color: var(--text);
   }
-  .segmented button.active {
+  .segmented button.active,
+  .segmented button[aria-pressed="true"] {
     background: var(--surface-3);
     color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent-border);
   }
+  .segmented button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .kbd-hint {
     font-family: var(--font-mono);
     font-size: 12px;
@@ -1628,6 +1684,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--text-secondary);
     min-height: 16px;
   }
+  .status-line.error { color: var(--danger); }
+  .btn.is-busy::after {
+    content: "";
+    width: 0.7em;
+    height: 0.7em;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: btn-spin 0.7s linear infinite;
+  }
+  @keyframes btn-spin { to { transform: rotate(360deg); } }
+  .pending-note em { animation: pending-pulse 1.4s ease-in-out infinite; }
+  @keyframes pending-pulse { 50% { opacity: 0.45; } }
 
   /* Toast Notification */
   .toast {
@@ -1652,6 +1721,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     opacity: 1;
     transform: translateY(0);
   }
+  .toast.error { border-color: var(--danger); }
 
   /* Lightbox Gallery */
   .lightbox {
@@ -1730,7 +1800,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .shelf-view { display:none; }
   .library-mode .shelf-view { display:block; flex:1; overflow:auto; padding:36px clamp(20px, 4vw, 56px) 64px; }
   .library-mode .topbar, .library-mode .tabs-bar, .library-mode .tab-view, .library-mode .ask-bar { display:none; }
-  .library-mode .shelf-nav { color:var(--accent); border-color:var(--accent-border); }
+  .library-mode #shelf-nav, .progress-mode #progress-nav { color:var(--accent); border-color:var(--accent-border); }
+  .progress-view { display:none; }
+  .progress-mode .progress-view { display:block; flex:1; overflow:auto; padding:36px clamp(20px, 4vw, 56px) 64px; }
+  .progress-mode .shelf-view, .progress-mode .topbar, .progress-mode .tabs-bar, .progress-mode .tab-view, .progress-mode .ask-bar { display:none; }
+  .progress-grid { display:grid; gap:28px; margin-top:28px; }
+  .progress-grid h2 { margin:0 0 12px; font-size:18px; letter-spacing:-.01em; }
+  .stat-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:10px; align-items:center; margin:8px 0; font-size:13px; }
+  .stat-bar { height:8px; background:var(--track); border-radius:999px; overflow:hidden; }
+  .stat-bar > span { display:block; height:100%; width:0; background:var(--accent); border-radius:999px; }
+  .stat-bar > span.playing { background:var(--green); }
+  .stat-bar > span.backlog { background:var(--blue); }
+  .stat-bar > span.paused { background:var(--accent); }
+  .stat-bar > span.beaten { background:var(--plum); }
+  .stat-bar > span.dropped { background:var(--danger); }
+  .stat-count, .queue-pos { font-family:var(--font-mono); font-variant-numeric:tabular-nums; color:var(--text-secondary); }
+  .queue-pos { min-width:1.5em; }
+  .progress-list, .progress-queue { list-style:none; margin:0; padding:0; display:grid; gap:8px; }
+  .progress-link { display:flex; align-items:center; gap:10px; width:100%; min-width:0; text-align:left; padding:8px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-1); color:var(--text); font:inherit; cursor:pointer; }
+  .progress-link:hover, .progress-link:focus-visible { border-color:var(--accent-border); }
+  .progress-link strong { overflow-wrap:anywhere; }
+  .progress-meta { margin-left:auto; color:var(--text-secondary); font-size:12px; }
+  .progress-empty { margin:0; color:var(--text-secondary); font-size:13px; }
+  .walk-row { display:grid; gap:6px; }
+  .walk-row-top { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+  .progress-link.walk-name { width:auto; border:0; background:transparent; padding:0; }
+  .progress-link.walk-name:hover, .progress-link.walk-name:focus-visible { color:var(--accent); }
+  .walk-row .game-progress-label { white-space:normal; text-align:right; }
   .shelf-heading { display:flex; justify-content:space-between; align-items:end; gap:20px; flex-wrap:wrap; padding-bottom:22px; border-bottom:1px solid var(--border); }
   .shelf-heading h1 { margin:0 0 6px; font-size:clamp(28px, 3vw, 38px); letter-spacing:-.03em; }
   .shelf-heading p, .shelf-empty, .shelf-help { color:var(--text-secondary); font-size:13px; margin:0; }
@@ -1744,13 +1840,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .shelf-cover { aspect-ratio:3 / 4; width:100%; display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:8px; background:var(--surface-2); border:1px solid var(--border); color:var(--text-secondary); font-size:36px; font-weight:700; box-shadow:0 6px 14px rgba(0,0,0,.18); }
   .shelf-cover img { width:100%; height:100%; object-fit:cover; }
   .shelf-game:hover .shelf-cover { border-color:var(--accent); }
-  .shelf-game:focus-visible, .shelf-nav:focus-visible, .shelf-controls select:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  .shelf-game:focus-visible, .shelf-nav:focus-visible, .progress-link:focus-visible, .shelf-controls select:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
   .shelf-title { display:block; font-size:14px; font-weight:650; line-height:1.35; margin-top:10px; overflow-wrap:anywhere; }
   .shelf-meta { display:flex; flex-wrap:wrap; gap:5px 9px; margin-top:5px; font-size:12px; color:var(--text-secondary); }
   .score-label { font-size:12px; color:var(--text-secondary); }
   .shelf-empty { padding:36px 0; line-height:1.6; }
   .shelf-empty h2 { margin:0 0 6px; color:var(--text); font-size:18px; }
   .shelf-empty p { margin:0 0 16px; }
+  .spoiler-banner {
+    margin: 0;
+    padding: 8px 24px;
+    font-size: 13px;
+    line-height: 1.45;
+    background: var(--accent-soft);
+    color: var(--text);
+    border-bottom: 1px solid var(--accent-border);
+  }
+  .spoiler-banner[data-level="strategy"] { background: var(--blue-soft); border-bottom-color: rgba(92, 149, 214, 0.35); }
+  .spoiler-banner[data-level="answer"] { background: var(--green-soft); border-bottom-color: var(--green-border); }
+  .library-mode .spoiler-banner, .progress-mode .spoiler-banner { display: none; }
+  .empty-state {
+    max-width: 620px;
+    margin: 24px;
+    padding: 28px;
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius);
+  }
+  .empty-state h2 { margin: 0 0 8px; padding: 0; border: none; font-size: 18px; }
+  .empty-state p { margin: 0 0 16px; color: var(--text-secondary); line-height: 1.55; }
+  .empty-state p:last-child { margin-bottom: 0; }
+  .empty-state-compact { margin: 8px; padding: 12px 14px; }
   .modal-status { margin:0; font-size:13px; color:var(--text-secondary); }
   .modal-status.error { color:var(--danger); }
   .modal-status:empty { display:none; }
@@ -1763,7 +1882,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .shelf-heading { display:block; }
     .shelf-controls { margin-top:16px; }
     .library-mode .games-list { display:none; }
-    .library-mode .shelf-view { padding:24px 18px 48px; overflow:visible; }
+    .library-mode .shelf-view, .progress-mode .progress-view { padding:24px 18px 48px; overflow:visible; }
     .shelf-grid { grid-template-columns:repeat(auto-fill,minmax(112px,1fr)); gap:18px 12px; }
     .shelf-heading { align-items:start; }
   }
@@ -1792,10 +1911,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="update-panel">
       <button type="button" class="btn btn-sm" id="open-setup" onclick="openSetupModal()">Setup</button>
-      <button type="button" class="btn btn-sm" id="check-updates" onclick="checkForUpdates()">Check for updates</button>
+      <button type="button" class="btn btn-sm" id="check-updates" onclick="checkForUpdates(false)">Check for updates</button>
+      <button type="button" class="btn btn-sm" id="install-update" onclick="installUpdate()" hidden>Update now</button>
       <div id="update-result" class="update-result" role="status" aria-live="polite"></div>
     </div>
-    <button type="button" class="shelf-nav" onclick="showShelf()">&#8592; Your shelf</button>
+    <button type="button" class="shelf-nav" id="shelf-nav" onclick="showShelf()">&#8592; Your shelf</button>
+    <button type="button" class="shelf-nav" id="progress-nav" onclick="showProgress()">Progress</button>
     <div class="library-search"><label class="visually-hidden" for="library-search">Search your games</label><input type="search" id="library-search" placeholder="Search your games and guides"></div>
     <div class="status-filters" id="status-filters"></div>
     <div class="games-list" id="games-list"></div>
@@ -1810,6 +1931,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div id="shelf-content"></div>
       <div class="guide-hits" id="guide-hits" aria-live="polite"></div>
     </section>
+    <section class="progress-view" id="progress-view" aria-labelledby="progress-title">
+      <div class="shelf-heading"><div><h1 id="progress-title">Progress</h1><p id="progress-summary">Backlog, recent notes, and walkthroughs from your notes folder.</p></div></div>
+      <div id="progress-content"></div>
+    </section>
     <header class="topbar">
       <div class="topbar-primary">
         <div class="game-header-info" id="game-header-info">
@@ -1818,17 +1943,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="controls-group">
           <div class="control-cluster">
             <span class="control-label">Spoiler</span>
-            <div class="segmented" id="spoiler-control" title="Spoiler Level (Keys 1, 2, 3)">
-              <button data-spoiler="hint" class="active">Hint <span class="kbd-hint">1</span></button>
-              <button data-spoiler="strategy">Strategy <span class="kbd-hint">2</span></button>
-              <button data-spoiler="answer">Answer <span class="kbd-hint">3</span></button>
+            <div class="segmented" id="spoiler-control" role="group" aria-label="Spoiler level" title="Spoiler level (keys 1, 2, 3)">
+              <button type="button" data-spoiler="hint" class="active" aria-pressed="true">Hint <span class="kbd-hint">1</span></button>
+              <button type="button" data-spoiler="strategy" aria-pressed="false">Strategy <span class="kbd-hint">2</span></button>
+              <button type="button" data-spoiler="answer" aria-pressed="false">Answer <span class="kbd-hint">3</span></button>
             </div>
           </div>
           <div class="control-cluster">
             <span class="control-label">Agent</span>
-            <div class="segmented" id="backend-control" title="AI Backend">
-              <button data-backend="claude" class="active">Claude</button>
-              <button data-backend="codex">Codex</button>
+            <div class="segmented" id="backend-control" role="group" aria-label="AI backend" title="AI backend">
+              <button type="button" data-backend="claude" class="active" aria-pressed="true">Claude</button>
+              <button type="button" data-backend="codex" aria-pressed="false">Codex</button>
             </div>
           </div>
           <button class="btn btn-primary btn-sm" id="build-walkthrough-btn">Build walkthrough</button>
@@ -1878,6 +2003,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span>/ Filter</span>
       </div>
     </nav>
+    <p class="spoiler-banner" id="spoiler-banner" role="status" data-level="hint">Hint is on. Strategy and answers stay hidden.</p>
 
     <section class="tab-view active" id="walk-tab">
       <div class="walk-layout">
@@ -1904,7 +2030,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <section class="tab-view" id="answer-tab">
       <div class="scroll-body md-content" id="answer-content">
-        <p style="color:var(--text-secondary)">Ask a question below or build a walkthrough for this game.</p>
+        <div class="empty-state">
+          <h2>No answer yet</h2>
+          <p>Ask about the spot you're stuck on, or build a walkthrough. Replies follow the spoiler level shown above.</p>
+        </div>
       </div>
     </section>
 
@@ -1922,8 +2051,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <footer class="ask-bar">
     <form class="ask-row" id="ask-form">
       <label class="visually-hidden" for="question-input">Ask about this game</label>
-      <input type="text" class="ask-input" id="question-input" placeholder="Where are you stuck?" autocomplete="off">
-      <button type="submit" class="btn btn-primary">Ask Guide</button>
+      <input type="text" class="ask-input" id="question-input" placeholder="Where are you stuck? Replies stay at Hint." autocomplete="off">
+      <button type="submit" class="btn btn-primary" id="ask-submit" disabled>Ask Guide</button>
       <button type="button" class="btn" id="new-chat-btn" title="Reset conversation context">New Chat</button>
     </form>
     <div class="status-line" id="status-line" role="status" aria-live="polite"></div>
@@ -1944,6 +2073,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label for="modal-game-name">Game Title *</label>
           <input type="text" id="modal-game-name" class="form-input" placeholder="e.g. Fire Emblem: Fortune's Weave" required>
         </div>
+        <details id="modal-more">
+        <summary>Platform, genre, status and notes (optional)</summary>
         <div class="form-row-2">
           <div class="form-field">
             <label for="modal-game-platform">Platform</label>
@@ -1988,6 +2119,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label for="modal-game-notes">Starting Notes / Build / Goals (optional)</label>
           <textarea id="modal-game-notes" class="form-textarea" rows="3" placeholder="e.g. Playing on Maddening mode, focusing on Blaze Arts & Spear units..."></textarea>
         </div>
+        </details>
         <label id="modal-auto-walk-wrap" style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
           <input type="checkbox" id="modal-auto-walkthrough">
           <span>Automatically build full chapter-by-chapter walkthrough after saving</span>
@@ -2082,7 +2214,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <!-- Lightbox Gallery -->
-<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+<div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Map or screenshot" onclick="closeLightbox()">
   <div class="lightbox-stage" id="lightbox-stage" onclick="event.stopPropagation()"></div>
   <div class="lightbox-bar" onclick="event.stopPropagation()">
     <button type="button" class="btn btn-sm" id="lightbox-prev" onclick="stepLightbox(-1)">Prev</button>
@@ -2090,7 +2222,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="lightbox-counter" id="lightbox-counter">1 / 1</span>
     <button type="button" class="btn btn-sm" id="lightbox-next" onclick="stepLightbox(1)">Next</button>
     <button type="button" class="btn btn-sm" id="lightbox-zoom" onclick="toggleLightboxZoom()" aria-pressed="false">Zoom in</button>
-    <button type="button" class="btn btn-sm" onclick="closeLightbox()">Close (Esc)</button>
+    <button type="button" class="btn btn-sm" id="lightbox-close" onclick="closeLightbox()">Close (Esc)</button>
   </div>
 </div>
 
@@ -2101,6 +2233,7 @@ const state = {
   games: [],
   selected: null,
   spoiler: "hint",
+  busy: "",
   backend: "claude",
   statusFilter: "all",
   consoleFilter: "all",
@@ -2121,13 +2254,110 @@ const state = {
 };
 
 let toastTimer = null;
-function showToast(msg) {
+function showToast(msg, isError = false) {
   const el = document.getElementById("toast");
   if (!el || !msg) return;
   el.textContent = msg;
+  el.classList.toggle("error", Boolean(isError));
   el.classList.add("visible");
   if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove("visible"), 2600);
+  toastTimer = setTimeout(() => el.classList.remove("visible"), isError ? 5600 : 2600);
+}
+
+function spoilerName(level = state.spoiler) {
+  return level.charAt(0).toUpperCase() + level.slice(1);
+}
+
+const SPOILER_NOTE = {
+  hint: "Hint is on. Strategy and answers stay hidden.",
+  strategy: "Strategy is on. Answers stay hidden.",
+  answer: "Answer is on. Nothing is hidden.",
+};
+
+function syncSpoilerChrome() {
+  document.querySelectorAll("#spoiler-control button").forEach(b => {
+    const on = b.dataset.spoiler === state.spoiler;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  const banner = document.getElementById("spoiler-banner");
+  if (banner) {
+    banner.dataset.level = state.spoiler;
+    banner.textContent = SPOILER_NOTE[state.spoiler] || `${spoilerName()} is on.`;
+  }
+  const input = document.getElementById("question-input");
+  if (input) {
+    input.placeholder = state.spoiler === "answer"
+      ? "Where are you stuck? Answers are allowed."
+      : `Where are you stuck? Replies stay at ${spoilerName()}.`;
+  }
+}
+
+function syncAskButton() {
+  const ask = document.getElementById("ask-submit");
+  const input = document.getElementById("question-input");
+  if (!ask || !input || state.busy) return;
+  ask.disabled = input.value.trim() === "";
+}
+
+function setBusy(kind) {
+  state.busy = kind || "";
+  const on = Boolean(kind);
+  document.body.classList.toggle("is-busy", on);
+  const build = document.getElementById("build-walkthrough-btn");
+  if (build) {
+    build.disabled = on;
+    build.classList.toggle("is-busy", kind === "walkthrough");
+    build.textContent = kind === "walkthrough" ? "Building…" : "Build walkthrough";
+    build.setAttribute("aria-busy", kind === "walkthrough" ? "true" : "false");
+  }
+  const ask = document.getElementById("ask-submit");
+  if (ask) {
+    ask.classList.toggle("is-busy", kind === "ask");
+    ask.setAttribute("aria-busy", kind === "ask" ? "true" : "false");
+    ask.textContent = kind === "ask" ? "Asking…" : "Ask Guide";
+    if (on) ask.disabled = true;
+  }
+  const answer = document.getElementById("answer-content");
+  if (answer) answer.setAttribute("aria-busy", on ? "true" : "false");
+  document.querySelectorAll("[data-build-walkthrough]").forEach(btn => {
+    btn.disabled = on;
+    btn.classList.toggle("is-busy", kind === "walkthrough");
+    btn.textContent = kind === "walkthrough" ? "Building…" : "Build walkthrough";
+  });
+  if (!on) syncAskButton();
+}
+
+function errorText(data, fallback) {
+  const message = data && typeof data.error === "string" ? data.error.trim() : "";
+  return message || fallback;
+}
+
+async function readBody(resp) {
+  try {
+    const text = await resp.text();
+    if (!text) return {};
+    return JSON.parse(text);
+  } catch (err) {
+    return {};
+  }
+}
+
+async function requestJSON(url, options) {
+  let resp;
+  try {
+    resp = await fetch(url, options);
+  } catch (err) {
+    throw new Error("Could not reach GameGuider. Check that it is still running.");
+  }
+  const data = await readBody(resp);
+  if (!resp.ok) throw new Error(errorText(data, "Something went wrong. Please try again."));
+  return data;
+}
+
+function reportFailure(message) {
+  setStatus(message, true);
+  showToast(message, true);
 }
 
 function esc(str) {
@@ -2279,10 +2509,11 @@ window.loadStillFrames = async function(cardId) {
   setStatus(`Grabbing frames around ${fmtTime(at)}…`);
   try {
     const resp = await fetch(`/api/frames/${encodeURIComponent(vid)}?at=${at}`);
-    const data = await resp.json();
+    const data = await readBody(resp);
     if (!resp.ok || data.error) {
-      strip.innerHTML = `<div style="grid-column:1/-1;color:var(--danger);font-size:13px">Could not load still frames. You can watch the video on YouTube instead.</div>`;
-      setStatus("Could not load still frames.");
+      const message = errorText(data, "Could not load still frames. You can watch the video on YouTube instead.");
+      strip.innerHTML = `<div style="grid-column:1/-1;color:var(--danger);font-size:13px">${esc(message)}</div>`;
+      reportFailure(message);
       return;
     }
     strip.innerHTML = (data.frames || []).map(f => `
@@ -2293,8 +2524,9 @@ window.loadStillFrames = async function(cardId) {
     `).join("");
     setStatus("");
   } catch (err) {
-    strip.innerHTML = `<div style="grid-column:1/-1;color:var(--danger)">Could not load still frames. Please try again.</div>`;
-    setStatus("");
+    const message = "Could not load still frames. Please try again.";
+    strip.innerHTML = `<div style="grid-column:1/-1;color:var(--danger)">${esc(message)}</div>`;
+    reportFailure(message);
   }
 };
 
@@ -2306,10 +2538,11 @@ window.playMpv = async function(vid, at, label) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: vid, at, label }),
     });
-    const data = await resp.json();
-    setStatus(resp.ok ? "" : "Could not open the external player. You can watch the video on YouTube instead.");
+    const data = await readBody(resp);
+    if (resp.ok) setStatus("");
+    else reportFailure(errorText(data, "Could not open the external player. You can watch the video on YouTube instead."));
   } catch (err) {
-    setStatus("Could not open the external player. You can watch the video on YouTube instead.");
+    reportFailure("Could not open the external player. You can watch the video on YouTube instead.");
   }
 };
 
@@ -2348,7 +2581,7 @@ window.openLightbox = function(src, label = "") {
     state.lightboxIdx = 0;
   }
   updateLightboxView();
-  document.getElementById("lightbox").classList.add("open");
+  showLightbox();
 };
 
 window.stepLightbox = function(delta) {
@@ -2365,20 +2598,53 @@ window.toggleLightboxZoom = function() {
   button.setAttribute("aria-pressed", String(zoomed));
 };
 
+let lightboxReturnFocus = null;
+function showLightbox() {
+  const box = document.getElementById("lightbox");
+  const already = box.classList.contains("open");
+  if (!already) lightboxReturnFocus = document.activeElement;
+  box.classList.add("open");
+  if (!already) {
+    const closeBtn = document.getElementById("lightbox-close");
+    if (closeBtn) closeBtn.focus();
+  }
+}
 window.closeLightbox = function() {
   document.getElementById("lightbox").classList.remove("open");
+  const back = lightboxReturnFocus;
+  lightboxReturnFocus = null;
+  if (back && back.isConnected) back.focus();
 };
 
-function setStatus(text) {
-  document.getElementById("status-line").textContent = text || "";
+function setStatus(text, isError = false) {
+  const el = document.getElementById("status-line");
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("error", Boolean(isError && text));
 }
 
-window.setSpoiler = function(spoiler) {
+window.setSpoiler = async function(spoiler) {
+  if (!spoiler || spoiler === state.spoiler) return;
+  const previous = state.spoiler;
+  const rank = { hint: 0, strategy: 1, answer: 2 };
+  const stricter = (rank[spoiler] ?? 0) < (rank[previous] ?? 0);
   state.spoiler = spoiler;
-  document.querySelectorAll("#spoiler-control button").forEach(b => {
-    b.classList.toggle("active", b.dataset.spoiler === spoiler);
-  });
-  loadState(state.selected?.slug, false);
+  // A lower level must not announce itself while the previous page is still on screen.
+  if (!stricter) syncSpoilerChrome();
+  setStatus(`Showing ${spoilerName(spoiler)}…`);
+  const ok = await loadState(
+    state.selected?.slug,
+    false,
+    `Couldn't switch to ${spoilerName(spoiler)}. Still showing ${spoilerName(previous)}.`
+  );
+  if (ok === null) return; // a newer load owns the level; reverting would leave its page under the old banner
+  if (!ok && state.spoiler === spoiler) {
+    state.spoiler = previous;
+    syncSpoilerChrome();
+  } else if (ok && state.spoiler === spoiler) {
+    syncSpoilerChrome();
+    setStatus("");
+  }
 };
 
 function applyStateData(data, switchedGame = false) {
@@ -2401,14 +2667,20 @@ function applyStateData(data, switchedGame = false) {
 }
 
 let stateSeq = 0;
-async function loadState(gameSlug = null, switchedGame = true) {
+async function loadState(gameSlug = null, switchedGame = true, failureMessage = "") {
   const seq = ++stateSeq;
   const params = new URLSearchParams({ spoiler: state.spoiler });
   if (gameSlug) params.set("game", gameSlug);
-  const resp = await fetch(`/api/state?${params}`);
-  const data = await resp.json();
-  if (seq !== stateSeq) return;  // a newer load superseded this one (e.g. Answer requested after Hint): showing it would un-redact the page
-  applyStateData(data, switchedGame);
+  try {
+    const data = await requestJSON(`/api/state?${params}`);
+    if (seq !== stateSeq) return null;  // a newer load superseded this one (e.g. Answer requested after Hint): showing it would un-redact the page
+    applyStateData(data, switchedGame);
+    return true;
+  } catch (err) {
+    if (seq !== stateSeq) return null;
+    reportFailure(failureMessage || err.message || "Couldn't reload.");
+    return false;
+  }
 }
 
 window.setStatusFilter = function(filter) {
@@ -2502,8 +2774,8 @@ function renderLibrary() {
 
   if (!filteredGames.length) {
     gamesEl.innerHTML = `
-      <div style="padding:18px 14px;color:var(--text-secondary);font-size:13px;text-align:center">
-        <p style="margin:0 0 10px">${state.librarySearch ? "No games match your search." : "No games in this view yet."}</p>
+      <div class="empty-state empty-state-compact">
+        <p>${state.librarySearch ? "No games match that search." : "No games in this view."}</p>
         ${state.games.length ? `<button type="button" class="btn btn-sm" onclick="clearLibraryFilters()">Clear filters</button>` : `<button type="button" class="btn btn-primary btn-sm" onclick="openGameModal(false)">Add your first game</button>`}
       </div>
     `;
@@ -2644,6 +2916,7 @@ function renderUI() {
   renderNotesTab();
   renderMapsTab();
   renderMediaTab();
+  if (document.querySelector(".app-shell").classList.contains("progress-mode")) loadProgress();
 }
 
 window.onHeaderChapterSelect = function(val) {
@@ -2654,24 +2927,89 @@ window.onHeaderChapterSelect = function(val) {
   switchTab("walk-tab");
 };
 
+let progressSeq = 0;
+async function loadProgress() {
+  const seq = ++progressSeq;
+  const el = document.getElementById("progress-content");
+  try {
+    const resp = await fetch("/api/progress");
+    const data = await resp.json();
+    if (seq !== progressSeq) return;
+    if (!resp.ok || data.error) {
+      el.innerHTML = `<p class="progress-empty">${esc(data.error || "Could not read your notes.")}</p>`;
+      return;
+    }
+    renderProgress(data);
+  } catch (err) {
+    if (seq !== progressSeq) return;
+    el.innerHTML = `<p class="progress-empty">Could not read your notes. Reload the library and try again.</p>`;
+  }
+}
+
+function renderProgress(data) {
+  const counts = data.counts || {};
+  const known = ["Playing", "Backlog", "Paused", "Beaten", "Dropped"];
+  const keys = known.concat(Object.keys(counts).filter(key => !known.includes(key)));
+  const max = Math.max(1, ...keys.map(key => Number(counts[key]) || 0));
+  const total = keys.reduce((sum, key) => sum + (Number(counts[key]) || 0), 0);
+  const bars = keys.map(key => {
+    const n = Number(counts[key]) || 0;
+    const width = Math.round((n / max) * 100);
+    return `<div class="stat-row"><span>${esc(key)}</span><div class="stat-bar" role="meter" aria-valuenow="${n}" aria-valuemin="0" aria-valuemax="${max}" aria-label="${esc(key)}"><span class="${statusClass(key)}" style="width:${width}%"></span></div><span class="stat-count">${n}</span></div>`;
+  }).join("");
+  const queue = (data.backlog || []).map(game => {
+    const meta = [game.platform, game.spot].filter(Boolean).map(esc).join(" · ");
+    return `<li><button type="button" class="progress-link" ${act("selectGame", game.slug)}><span class="queue-pos">${Number(game.position) || ""}</span><strong>${esc(game.name)}</strong>${meta ? `<span class="progress-meta">${meta}</span>` : ""}</button></li>`;
+  }).join("");
+  const recent = (data.recent || []).map(game => `<li><button type="button" class="progress-link" ${act("selectGame", game.slug)}><strong>${esc(game.name)}</strong><span class="pill ${statusClass(game.status)}">${esc(game.status || "")}</span><span class="progress-meta">${esc(game.ago || "")}</span></button></li>`).join("");
+  const walks = (data.progress || []).map(game => {
+    const chapters = Number(game.chapters) || 0;
+    const current = Number(game.current) || 0;
+    const pct = Math.max(0, Math.min(100, Number(game.percent) || 0));
+    const place = current ? `Chapter ${current} of ${chapters}` : `${chapters} ${chapters === 1 ? "chapter" : "chapters"}`;
+    const title = game.chapter ? ` · ${esc(game.chapter)}` : "";
+    return `<li class="walk-row"><div class="walk-row-top"><button type="button" class="progress-link walk-name" ${act("selectGame", game.slug)}><strong>${esc(game.name)}</strong></button><span class="game-progress-label">${place}${title}</span></div><div class="game-progress-bar" role="meter" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(game.name)}"><div class="game-progress-fill" style="width:${pct}%"></div></div></li>`;
+  }).join("");
+  const empty = `<p class="progress-empty">`;
+  document.getElementById("progress-summary").textContent = total ? `${total} ${total === 1 ? "game" : "games"} tracked in your notes.` : "Your notes folder has no tracked games yet.";
+  document.getElementById("progress-content").innerHTML = `<div class="progress-grid"><section><h2>By status</h2>${bars}</section><section><h2>Backlog queue</h2>${queue ? `<ol class="progress-queue">${queue}</ol>` : `${empty}No games are waiting in the backlog.</p>`}</section><section><h2>Recent activity</h2>${recent ? `<ul class="progress-list">${recent}</ul>` : `${empty}No notes or walkthrough files yet.</p>`}</section><section><h2>Walkthroughs</h2>${walks ? `<ul class="progress-list">${walks}</ul>` : `${empty}No saved walkthroughs yet. Open a game and build one to track chapters.</p>`}</section></div>`;
+}
+
+window.showProgress = function() {
+  const shell = document.querySelector(".app-shell");
+  shell.classList.remove("library-mode");
+  shell.classList.add("progress-mode");
+  const el = document.getElementById("progress-content");
+  if (!el.innerHTML) el.innerHTML = `<p class="progress-empty">Reading your notes…</p>`;
+  loadProgress();
+};
 window.showShelf = function() {
-  document.querySelector(".app-shell").classList.add("library-mode");
+  const shell = document.querySelector(".app-shell");
+  shell.classList.remove("progress-mode");
+  shell.classList.add("library-mode");
   renderLibrary();
 };
 window.selectGame = function(slug) {
-  document.querySelector(".app-shell").classList.remove("library-mode");
-  loadState(slug, true);
+  document.querySelector(".app-shell").classList.remove("library-mode", "progress-mode");
+  setStatus("Opening game…");
+  loadState(slug, true).then(ok => { if (ok === true && state.selected?.slug === slug) setStatus(""); });
 };
-window.checkForUpdates = async function() {
+
+// quiet is the check at launch: it says nothing unless a newer version exists, and never reports a failed check.
+window.checkForUpdates = async function(quiet) {
   const button = document.getElementById("check-updates");
   const result = document.getElementById("update-result");
-  button.disabled = true;
-  button.textContent = "Checking…";
-  result.textContent = "";
+  if (!quiet) {
+    button.disabled = true;
+    button.textContent = "Checking…";
+    result.textContent = "";
+  }
   try {
     const response = await fetch("/api/updates/check", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
     if (!response.ok) throw new Error("Update check failed.");
     const data = await response.json();
+    if (quiet && data.status !== "available") return;
+    result.textContent = "";
     const messages = {
       current: "GameGuider is up to date.",
       available: "A newer version of GameGuider is available.",
@@ -2688,6 +3026,8 @@ window.checkForUpdates = async function() {
       warning.textContent = "This installation has local changes. Review them before updating.";
       result.appendChild(warning);
     }
+    // A release number means an installed copy, which the app can update itself; a checkout updates with git.
+    document.getElementById("install-update").hidden = !(data.status === "available" && data.latest);
     if (["available", "unsupported", "local_ahead", "diverged"].includes(data.status)) {
       const help = document.createElement("p");
       const link = document.createElement("a");
@@ -2699,10 +3039,36 @@ window.checkForUpdates = async function() {
       result.appendChild(help);
     }
   } catch (_) {
-    result.textContent = "Could not check for updates. Please try again.";
+    if (!quiet) result.textContent = "Could not check for updates. Please try again.";
+  } finally {
+    if (!quiet) {
+      button.disabled = false;
+      button.textContent = "Check for updates";
+    }
+  }
+};
+window.installUpdate = async function() {
+  const button = document.getElementById("install-update");
+  const result = document.getElementById("update-result");
+  button.disabled = true;
+  button.textContent = "Updating…";
+  result.textContent = "Installing the update. This can take a minute; keep GameGuider open.";
+  try {
+    const response = await fetch("/api/updates/install", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    const data = await response.json().catch(() => ({}));
+    result.textContent = data.message || data.error || "Could not install the update. Please try again.";
+    if (data.status === "installed") {
+      button.hidden = true;
+    } else if (data.detail) {
+      const detail = document.createElement("p");
+      detail.textContent = data.detail;
+      result.appendChild(detail);
+    }
+  } catch (_) {
+    result.textContent = "Could not install the update. Please try again.";
   } finally {
     button.disabled = false;
-    button.textContent = "Check for updates";
+    button.textContent = "Update now";
   }
 };
 window.prepareShare = function() {
@@ -2724,8 +3090,8 @@ window.downloadShare = async function(event) {
   try {
     const response = await fetch(`/api/share?${params}`);
     if (!response.ok) {
-      const data = await response.json();
-      throw new Error(data.error || "Could not prepare this guide.");
+      const data = await readBody(response);
+      throw new Error(errorText(data, "Could not prepare this guide."));
     }
     const url = URL.createObjectURL(await response.blob());
     const link = document.createElement("a");
@@ -2737,7 +3103,9 @@ window.downloadShare = async function(event) {
     setTimeout(() => URL.revokeObjectURL(url), 60000);
     showToast("Guide ready to save and share");
   } catch (err) {
-    error.textContent = err.message || "Could not prepare this guide. Please try again.";
+    const message = err.message || "Could not prepare this guide. Please try again.";
+    error.textContent = message;
+    showToast(message, true);
   } finally {
     button.disabled = false;
     button.textContent = "Download guide";
@@ -2750,6 +3118,7 @@ window.fetchCover = async function() {
   const button = document.getElementById("fetch-cover");
   const errorEl = document.getElementById("cover-error");
   errorEl.textContent = "";
+  const idleLabel = button.textContent;
   button.disabled = true;
   button.textContent = "Finding cover…";
   try {
@@ -2760,9 +3129,11 @@ window.fetchCover = async function() {
     else applyStateData(data, false);
     showToast("Cover artwork added");
   } catch (err) {
-    errorEl.textContent = err.message || "Could not find cover artwork.";
+    const message = err.message || "Could not find cover artwork.";
+    errorEl.textContent = message;
+    showToast(message, true);
     button.disabled = false;
-    button.textContent = "Find cover artwork";
+    button.textContent = idleLabel;
   }
 };
 function scoreSummary(score) {
@@ -2776,6 +3147,7 @@ window.refreshScore = async function() {
   const button = document.getElementById("refresh-score");
   const errorEl = document.getElementById("score-error");
   errorEl.textContent = "";
+  const idleLabel = button.textContent;
   button.disabled = true;
   button.textContent = "Fetching score…";
   try {
@@ -2786,9 +3158,11 @@ window.refreshScore = async function() {
     else applyStateData(data, false);
     showToast("Critic score updated");
   } catch (err) {
-    errorEl.textContent = (err.fromServer && err.message) || "Could not fetch a critic score. Check your connection and try again.";
+    const message = (err.fromServer && err.message) || "Could not fetch a critic score. Check your connection and try again.";
+    errorEl.textContent = message;
+    showToast(message, true);
     button.disabled = false;
-    button.textContent = "Get critic score";
+    button.textContent = idleLabel;
   }
 };
 
@@ -2801,44 +3175,45 @@ window.moveGame = async function(slug, delta) {
   if (idx < 0 || target < 0 || target >= visible.length) return;
   [visible[idx], visible[target]] = [visible[target], visible[idx]];
   setStatus("Saving Backlog queue order…");
-  const resp = await fetch("/api/games/reorder", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      ordered_slugs: visible.map(g => g.slug),
-      status_filter: state.statusFilter,
-      game: state.selected?.slug,
-      spoiler: state.spoiler,
-    }),
-  });
-  const data = await resp.json();
-  if (resp.ok) {
+  try {
+    const data = await requestJSON("/api/games/reorder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ordered_slugs: visible.map(g => g.slug),
+        status_filter: state.statusFilter,
+        game: state.selected?.slug,
+        spoiler: state.spoiler,
+      }),
+    });
     applyStateData(data, false);
     setStatus("Backlog queue order saved");
-  } else {
-    setStatus(data.error || "Failed to reorder games");
+  } catch (err) {
+    reportFailure(err.message || "Couldn't save the queue order.");
   }
 };
 
 window.quickUpdateStatus = async function(newStatus) {
   if (!state.selected) return;
+  const previous = state.selected.status || "Playing";
   setStatus(`Saving status: ${newStatus}…`);
-  const resp = await fetch("/api/games/spot", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      game: state.selected.slug,
-      status: newStatus,
-      spoiler: state.spoiler,
-    }),
-  });
-  const data = await resp.json();
-  if (resp.ok) {
+  try {
+    const data = await requestJSON("/api/games/spot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        game: state.selected.slug,
+        status: newStatus,
+        spoiler: state.spoiler,
+      }),
+    });
     applyStateData(data, false);
     setStatus(`Saved status: ${newStatus}`);
     showToast(`Status updated to ${newStatus}`);
-  } else {
-    setStatus(data.error || "Failed to update status");
+  } catch (err) {
+    const select = document.querySelector("#game-header-info .status-select");
+    if (select) select.value = previous;
+    reportFailure(err.message || "Couldn't update the status.");
   }
 };
 
@@ -2852,23 +3227,25 @@ window.quickUpdateSpot = async function(e) {
 
 window.setGameSpot = async function(newSpot, jumpToChapter = false) {
   if (!state.selected) return;
+  const previous = state.selected.spot || "";
   setStatus(`Updating current spot to "${newSpot || "?"}"…`);
-  const resp = await fetch("/api/games/spot", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      game: state.selected.slug,
-      spot: newSpot,
-      spoiler: state.spoiler,
-    }),
-  });
-  const data = await resp.json();
-  if (resp.ok) {
+  try {
+    const data = await requestJSON("/api/games/spot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        game: state.selected.slug,
+        spot: newSpot,
+        spoiler: state.spoiler,
+      }),
+    });
     applyStateData(data, jumpToChapter);
     setStatus(`Current spot saved: ${newSpot || "?"}`);
     showToast(`Current spot saved: ${newSpot || "?"}`);
-  } else {
-    setStatus(data.error || "Failed to save spot");
+  } catch (err) {
+    const input = document.getElementById("header-spot-input");
+    if (input) input.value = previous;
+    reportFailure(err.message || "Couldn't save the current spot.");
   }
 };
 
@@ -2898,6 +3275,8 @@ window.openGameModal = function(isEdit = false) {
   const autoWalkWrap = document.getElementById("modal-auto-walk-wrap");
   const autoWalkEl = document.getElementById("modal-auto-walkthrough");
   const deleteBtn = document.getElementById("modal-delete-btn");
+  // Adding asks for the title only; the rest stays one click away. Editing has existing values, so show them.
+  document.getElementById("modal-more").open = isEdit && !!state.selected;
 
   if (isEdit && state.selected) {
     const g = state.selected;
@@ -2929,7 +3308,7 @@ window.openGameModal = function(isEdit = false) {
   }
 
   modal.classList.add("open");
-  setTimeout(() => nameEl.focus(), 30);
+  nameEl.focus();
 };
 
 window.closeGameModal = function() {
@@ -3015,16 +3394,24 @@ async function runSetupStep(backend, step) {
 }
 
 async function recheckSetup() {
-  await loadSetup();
-  showToast(setupInfo && setupInfo.ready ? "GameGuider is ready." : "Not ready yet. Finish the steps above.");
+  const ok = await loadSetup(true);
+  if (!ok || !setupInfo) return;
+  showToast(setupInfo.ready ? "GameGuider is ready." : "Not ready yet. Finish the steps above.", !setupInfo.ready);
 }
 
-async function loadSetup() {
+async function loadSetup(announce = false) {
   try {
     const resp = await fetch("/api/setup");
-    if (resp.ok) setupInfo = await resp.json();
-  } catch (err) { /* the banner is a hint; without it the app still works */ }
-  renderSetup();
+    const data = await readBody(resp);
+    if (!resp.ok) throw new Error(errorText(data, "Couldn't load setup."));
+    setupInfo = data;
+    return true;
+  } catch (err) {
+    if (announce) showToast(err.message || "Couldn't load setup.", true);
+    return false;
+  } finally {
+    renderSetup();
+  }
 }
 
 window.setTheme = async function(name) {
@@ -3048,7 +3435,7 @@ window.openSetupModal = async function() {
   await loadSetup();
   const input = document.getElementById("setup-notes-dir");
   if (setupInfo) input.value = setupInfo.notes_dir;
-  setTimeout(() => input.focus(), 30);
+  input.focus();
 };
 
 window.closeSetupModal = function() {
@@ -3081,7 +3468,7 @@ window.openBacklogModal = function() {
   modalReturnFocus = document.activeElement;
   setModalStatus("backlog-modal-status", "");
   document.getElementById("backlog-modal").classList.add("open");
-  setTimeout(() => document.getElementById("backlog-games-input").focus(), 30);
+  document.getElementById("backlog-games-input").focus();
 };
 
 window.closeBacklogModal = function() {
@@ -3113,7 +3500,7 @@ window.submitBacklogModal = async function(e) {
     });
     const data = await resp.json();
     if (!resp.ok) {
-      setModalStatus("backlog-modal-status", "Could not add these games. Check the list and try again.", true);
+      setModalStatus("backlog-modal-status", errorText(data, "Could not add these games. Check the list and try again."), true);
       return;
     }
     closeBacklogModal();
@@ -3168,7 +3555,7 @@ window.submitGameModal = async function(e) {
     });
     const data = await resp.json();
     if (!resp.ok) {
-      setModalStatus("game-modal-status", "Could not save this game. Check the details and try again.", true);
+      setModalStatus("game-modal-status", errorText(data, "Could not save this game. Check the details and try again."), true);
       return;
     }
     closeGameModal();
@@ -3176,7 +3563,7 @@ window.submitGameModal = async function(e) {
     setStatus(`Saved ${name}`);
     showToast(`Saved ${name}`);
     if (!slug && autoWalk) {
-      document.querySelector(".app-shell").classList.remove("library-mode");
+      document.querySelector(".app-shell").classList.remove("library-mode", "progress-mode");
       window.triggerBuildWalkthrough();
     }
   } catch (_) {
@@ -3189,6 +3576,8 @@ window.submitGameModal = async function(e) {
 window.deleteCurrentGame = async function() {
   if (!state.selected) return;
   const name = state.selected.name;
+  const button = document.getElementById("modal-delete-btn");
+  button.disabled = true;
   setModalStatus("game-modal-status", "Removing game…");
   try {
     const resp = await fetch("/api/games/delete", {
@@ -3203,10 +3592,12 @@ window.deleteCurrentGame = async function() {
       setStatus(`Removed ${name} from tracker (notes & walkthrough files kept safe).`);
       showToast(`Untracked ${name}`);
     } else {
-      setModalStatus("game-modal-status", "Could not remove this game. Please try again.", true);
+      setModalStatus("game-modal-status", errorText(data, "Could not remove this game. Please try again."), true);
     }
   } catch (_) {
     setModalStatus("game-modal-status", "Could not remove this game. Please try again.", true);
+  } finally {
+    if (button.isConnected) button.disabled = false;
   }
 };
 
@@ -3268,19 +3659,26 @@ function renderWalkthroughTab() {
 
   if (!state.walkthrough.length) {
     if (jumpSlot) jumpSlot.innerHTML = "";
-    listEl.innerHTML = `<div style="padding:12px;color:var(--text-secondary);font-size:13px">No walkthrough built yet.</div>`;
-    const gName = state.selected ? esc(state.selected.name) : "your game";
+    if (!state.selected) {
+      listEl.innerHTML = `<div class="empty-state empty-state-compact"><p>Pick a game to see its chapters.</p></div>`;
+      contentEl.innerHTML = `
+        <div class="empty-state">
+          <h2>No game selected</h2>
+          <p>Add a game, or pick one from your shelf, then build a walkthrough for the spot you're stuck on.</p>
+          <button type="button" class="btn btn-primary" onclick="openGameModal(false)">Add a game</button>
+        </div>`;
+      return;
+    }
+    listEl.innerHTML = `<div class="empty-state empty-state-compact"><p>Chapters show up here after you build a walkthrough.</p></div>`;
+    const building = state.busy === "walkthrough";
     contentEl.innerHTML = `
-      <div style="padding:28px;border:1px dashed var(--border-strong);border-radius:var(--radius);max-width:620px;margin-top:24px">
-        <h2 style="margin-top:0;border:none">No full walkthrough for ${gName} yet</h2>
-        <p style="color:var(--text-secondary)">
-          Build a chapter-by-chapter guide with hints, strategies, and answers. Maps and videos are included when available.
-        </p>
-        <button type="button" class="btn btn-primary" onclick="triggerBuildWalkthrough()">
-          Build walkthrough
+      <div class="empty-state">
+        <h2>No walkthrough for ${esc(state.selected.name)} yet</h2>
+        <p>Build a chapter-by-chapter guide. Hints, strategy, and answers stay behind the spoiler level shown above.</p>
+        <button type="button" class="btn btn-primary${building ? " is-busy" : ""}" data-build-walkthrough ${building ? "disabled" : ""} onclick="triggerBuildWalkthrough()">
+          ${building ? "Building…" : "Build walkthrough"}
         </button>
-      </div>
-    `;
+      </div>`;
     return;
   }
 
@@ -3320,7 +3718,7 @@ function renderWalkthroughTab() {
   }).join("");
 
   if (!listEl.innerHTML.trim()) {
-    listEl.innerHTML = `<div class="shelf-empty" style="padding:12px"><p>No chapters match your search.</p><button type="button" class="btn btn-sm" onclick="clearChapterFilter()">Clear search</button></div>`;
+    listEl.innerHTML = `<div class="empty-state empty-state-compact"><p>No chapters match that search.</p><button type="button" class="btn btn-sm" onclick="clearChapterFilter()">Clear search</button></div>`;
   }
 
   const ch = state.walkthrough[state.selectedChapterIdx] || state.walkthrough[0];
@@ -3371,6 +3769,7 @@ window.clearChapterFilter = function() {
 window.askAboutChapter = function(title) {
   const input = document.getElementById("question-input");
   input.value = `Help with ${title}: `;
+  syncAskButton();
   input.focus();
 };
 
@@ -3379,7 +3778,7 @@ function renderNotesTab() {
   const el = document.getElementById("notes-content");
   if (!state.selected) {
     controlsEl.innerHTML = "";
-    el.innerHTML = `<p style="color:var(--text-secondary)">Select or add a game to track your notes and progress.</p>`;
+    el.innerHTML = `<div class="empty-state"><h2>No game selected</h2><p>Select a game from the shelf, or add one, to keep notes and progress.</p><button type="button" class="btn btn-primary btn-sm" onclick="openGameModal(false)">Add a game</button></div>`;
     return;
   }
 
@@ -3420,7 +3819,7 @@ function renderNotesTab() {
       </form>
     </div>
   `;
-  el.innerHTML = state.notesHtml || "<p><em>No notes yet. Add a progress note above or ask a question below.</em></p>";
+  el.innerHTML = state.notesHtml || `<div class="empty-state"><h2>No notes yet</h2><p>Add a progress note above, or ask about the spot you're stuck on. Notes follow the spoiler level shown above.</p></div>`;
   hydrate(el);
 }
 
@@ -3433,24 +3832,27 @@ window.saveRawNotes = async function() {
   if (!state.selected) return;
   const textarea = document.getElementById("raw-notes-textarea");
   if (!textarea) return;
+  const button = document.querySelector("#notes-tracker-controls .btn-primary");
+  if (button) button.disabled = true;
+  const notes = textarea.value;
   setStatus("Saving notes…");
-  const resp = await fetch("/api/games/notes", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      game: state.selected.slug,
-      notes: textarea.value,
-      spoiler: state.spoiler,
-    }),
-  });
-  const data = await resp.json();
-  if (resp.ok) {
+  try {
+    const data = await requestJSON("/api/games/notes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        game: state.selected.slug,
+        notes,
+        spoiler: state.spoiler,
+      }),
+    });
     state.editingNotes = false;
     applyStateData(data, false);
     setStatus("Notes saved");
     showToast("Saved notes");
-  } else {
-    setStatus(data.error || "Failed to save notes");
+  } catch (err) {
+    if (button && button.isConnected) button.disabled = false;
+    reportFailure(err.message || "Couldn't save notes.");
   }
 };
 
@@ -3462,32 +3864,37 @@ window.submitQuickNote = async function(e) {
   const spot = spotEl ? spotEl.value.trim() : "";
   const entry = textEl ? textEl.value.trim() : "";
   if (!entry) return;
+  const button = e.currentTarget.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
   setStatus("Saving progress note…");
-  const resp = await fetch("/api/games/notes", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      game: state.selected.slug,
-      spot: spot || undefined,
-      heading: spot || state.selected.spot || "Progress Log",
-      entry: `- ${entry}`,
-      spoiler: state.spoiler,
-    }),
-  });
-  const data = await resp.json();
-  if (resp.ok) {
+  try {
+    const data = await requestJSON("/api/games/notes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        game: state.selected.slug,
+        spot: spot || undefined,
+        heading: spot || state.selected.spot || "Progress Log",
+        entry: `- ${entry}`,
+        spoiler: state.spoiler,
+      }),
+    });
     applyStateData(data, false);
     setStatus("Progress note saved!");
     showToast("Progress note added");
-  } else {
-    setStatus(data.error || "Failed to save progress note");
+  } catch (err) {
+    if (button && button.isConnected) button.disabled = false;
+    reportFailure(err.message || "Couldn't save that note.");
   }
 };
 
 function renderMapsTab() {
   const el = document.getElementById("maps-content");
   if (!state.maps.length) {
-    el.innerHTML = `<h2>Maps</h2><p class="maps-intro">No saved maps are visible at the ${esc(state.spoiler)} spoiler level. Build a walkthrough or raise the spoiler level to see available maps.</p>`;
+    const hidden = state.spoiler === "answer"
+      ? "Build a walkthrough to save maps and screenshots here."
+      : `Maps saved above ${spoilerName()} stay hidden until you raise the spoiler level. You can also build a walkthrough.`;
+    el.innerHTML = `<div class="empty-state"><h2>No maps at ${esc(spoilerName())}</h2><p>${hidden}</p></div>`;
     return;
   }
   el.innerHTML = `<h2>Maps</h2><p class="maps-intro">Saved maps from your guide. Open a map to zoom in, or jump to its chapter.</p><div class="maps-grid">` + state.maps.map((map, i) => `
@@ -3505,7 +3912,7 @@ window.openMap = function(index) {
   state.lightboxItems = state.maps.map(m => ({src: m.src, label: m.label}));
   state.lightboxIdx = index;
   updateLightboxView();
-  document.getElementById("lightbox").classList.add("open");
+  showLightbox();
 };
 window.openChapter = function(index) { selectChapter(index); switchTab("walk-tab"); };
 
@@ -3515,7 +3922,7 @@ function renderMediaTab() {
   const vids = state.media.filter(m => m.type === "video");
 
   if (!imgs.length && !vids.length) {
-    el.innerHTML = `<p style="color:var(--text-secondary)">No visible maps or videos at the <code>${esc(state.spoiler)}</code> spoiler tier yet. Raise the spoiler level or build a walkthrough.</p>`;
+    el.innerHTML = `<div class="empty-state"><h2>No media at ${esc(spoilerName())}</h2><p>${state.spoiler === "answer" ? "Videos and screenshots show up here after a walkthrough saves them." : "Hidden clips and screenshots stay out of this view until you raise the spoiler level, or build a walkthrough."}</p></div>`;
     return;
   }
 
@@ -3548,7 +3955,9 @@ document.querySelectorAll("#backend-control button").forEach(btn => {
   btn.addEventListener("click", () => {
     state.backend = btn.dataset.backend;
     document.querySelectorAll("#backend-control button").forEach(b => {
-      b.classList.toggle("active", b.dataset.backend === state.backend);
+      const on = b.dataset.backend === state.backend;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
     });
   });
 });
@@ -3569,8 +3978,11 @@ function searchGuides(text) {
     let hits = null;
     try {
       const resp = await fetch(`/api/search?${new URLSearchParams({ q: query, spoiler: state.spoiler })}`);
-      if (resp.ok) hits = await resp.json();
-    } catch (err) { /* searching guides is a bonus on top of the title filter */ }
+      const data = await readBody(resp);
+      hits = resp.ok ? data : { error: errorText(data, "Couldn't search your guides. Title matches still work."), query };
+    } catch (err) {
+      hits = { error: "Couldn't search your guides. Title matches still work.", query };
+    }
     if (seq !== guideSearchSeq) return;  // a newer search is on its way
     state.guideHits = hits;
     renderGuideHits();
@@ -3581,13 +3993,14 @@ function renderGuideHits() {
   const el = document.getElementById("guide-hits");
   const data = state.guideHits;
   if (!data) { el.innerHTML = ""; return; }
+  if (data.error) { el.innerHTML = `<h2>In your guides</h2><p>${esc(data.error)}</p>`; return; }
   el.innerHTML = `<h2>In your guides</h2>` + (data.results.length
     ? `<ul>${data.results.map(h => `<li><button type="button" class="guide-hit" ${act("openGuideHit", h.slug, h.chapter_index)}><span class="guide-hit-place">${esc(h.game)} · ${esc(h.place)}</span><span class="guide-hit-snippet">${esc(h.snippet)}</span></button></li>`).join("")}</ul>`
     : `<p>Nothing in your saved guides or notes matches “${esc(data.query)}” at the ${esc(state.spoiler)} spoiler level.</p>`);
 }
 
 async function openGuideHit(slug, chapterIndex) {
-  document.querySelector(".app-shell").classList.remove("library-mode");
+  document.querySelector(".app-shell").classList.remove("library-mode", "progress-mode");
   await loadState(slug, true);
   if (chapterIndex == null) switchTab("notes-tab");
   else openChapter(chapterIndex);
@@ -3598,7 +4011,17 @@ document.getElementById("chapter-filter").addEventListener("input", e => {
   renderWalkthroughTab();
 });
 
-document.getElementById("reload-btn").addEventListener("click", () => loadState(state.selected?.slug, false));
+document.getElementById("reload-btn").addEventListener("click", async () => {
+  const button = document.getElementById("reload-btn");
+  button.disabled = true;
+  button.classList.add("is-busy");
+  try {
+    await loadState(state.selected?.slug, false);
+  } finally {
+    button.disabled = false;
+    button.classList.remove("is-busy");
+  }
+});
 
 const ACTIONS = { chooseAi, copySetupCommand, runSetupStep, recheckSetup, openGuideHit, playInlineVideo, loadStillFrames, playMpv, openLightbox, setSpoiler, setStatusFilter, selectGame, moveGame, selectChapter, openChapter, scrollToVideo, setGameSpot, askAboutChapter, openMap };
 // Only the innermost action runs, so a queue button never also opens the game card around it.
@@ -3609,6 +4032,16 @@ document.addEventListener("click", e => {
 document.addEventListener("keydown", e => {
   if ((e.key === "Enter" || e.key === " ") && e.target.matches('[role="button"][data-action]')) { e.preventDefault(); e.target.click(); }
 });
+
+function trapTab(root, event) {
+  if (!root) return;
+  const controls = [...root.querySelectorAll('button:not(:disabled), input:not(:disabled):not([type="hidden"]), select:not(:disabled), textarea:not(:disabled), a[href]')].filter(el => el.getClientRects().length);
+  if (!controls.length) return;
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && document.activeElement === first) { last.focus(); event.preventDefault(); }
+  else if (!event.shiftKey && document.activeElement === last) { first.focus(); event.preventDefault(); }
+}
 
 // Global keyboard shortcuts for fast hands-on-controller operation
 document.addEventListener("keydown", e => {
@@ -3623,13 +4056,9 @@ document.addEventListener("keydown", e => {
     if (backlogModalOpen) { closeBacklogModal(); e.preventDefault(); return; }
     if (setupModalOpen) { closeSetupModal(); e.preventDefault(); return; }
   }
-  if (modalOpen && e.key === "Tab") {
-    const modal = document.getElementById(gameModalOpen ? "game-modal" : backlogModalOpen ? "backlog-modal" : "setup-modal");
-    const controls = [...modal.querySelectorAll('button:not(:disabled), input:not(:disabled):not([type="hidden"]), select:not(:disabled), textarea:not(:disabled), a[href]')].filter(el => el.getClientRects().length);
-    if (controls.length) {
-      if (e.shiftKey && document.activeElement === controls[0]) { controls[controls.length - 1].focus(); e.preventDefault(); }
-      else if (!e.shiftKey && document.activeElement === controls[controls.length - 1]) { controls[0].focus(); e.preventDefault(); }
-    }
+  if (e.key === "Tab" && (lbOpen || modalOpen)) {
+    const rootId = lbOpen ? "lightbox" : gameModalOpen ? "game-modal" : backlogModalOpen ? "backlog-modal" : "setup-modal";
+    trapTab(document.getElementById(rootId), e);
     return;
   }
   if (lbOpen) {
@@ -3660,19 +4089,31 @@ document.addEventListener("keydown", e => {
     setGameSpot(state.walkthrough[state.selectedChapterIdx].title, false);
     e.preventDefault();
   } else if (e.key === "/") {
-    const filterInput = document.querySelector(".app-shell").classList.contains("library-mode") ? document.getElementById("library-search") : document.getElementById("chapter-filter");
+    const shell = document.querySelector(".app-shell");
+    const filterInput = shell.classList.contains("library-mode")
+      ? document.getElementById("library-search")
+      : shell.classList.contains("progress-mode")
+        ? null
+        : document.getElementById("chapter-filter");
     if (filterInput) { filterInput.focus(); e.preventDefault(); }
   }
 });
 
 let streamSeq = 0;
-async function streamEndpoint(url, payload, promptDisplay) {
+function streamWaitCopy(kind) {
+  return kind === "walkthrough" ? "Building walkthrough…" : "Researching your guide…";
+}
+async function streamEndpoint(url, payload, promptDisplay, kind) {
   const seq = ++streamSeq;
   let answered = false;
+  setBusy(kind);
   switchTab("answer-tab");
   const answerEl = document.getElementById("answer-content");
-  answerEl.innerHTML = `<blockquote>${esc(promptDisplay)}</blockquote><p style="color:var(--text-secondary)"><em>Researching…</em></p>`;
-  setStatus("Researching your guide…");
+  const wait = kind === "walkthrough"
+    ? "Building the walkthrough. This can take a few minutes."
+    : "Researching your question. This can take a minute.";
+  answerEl.innerHTML = `<blockquote>${esc(promptDisplay)}</blockquote><p class="pending-note"><em>${wait}</em></p>`;
+  setStatus(streamWaitCopy(kind));
 
   try {
     const resp = await fetch(url, {
@@ -3681,7 +4122,10 @@ async function streamEndpoint(url, payload, promptDisplay) {
       body: JSON.stringify(payload),
     });
     if (!resp.ok) {
-      showMessage(answerEl, "Could not start the guide.", "Please try again.");
+      const data = await readBody(resp);
+      const message = errorText(data, "Could not start the guide. Please try again.");
+      showMessage(answerEl, "Could not start the guide.", message);
+      showToast(message, true);
       setStatus("");
       return;
     }
@@ -3698,15 +4142,17 @@ async function streamEndpoint(url, payload, promptDisplay) {
         if (!line.trim()) continue;
         const ev = JSON.parse(line);
         if (ev.kind === "status") {
-          setStatus("Researching your guide…");
+          setStatus(streamWaitCopy(kind));
         } else if (ev.kind === "error") {
           answered = true;
-          showMessage(answerEl, "Guide unavailable.", ev.message);
+          const message = ev.message || "Guide unavailable.";
+          showMessage(answerEl, "Guide unavailable.", message);
+          showToast(message, true);
           setStatus("");
           await loadState(state.selected?.slug, false);
         } else if (ev.kind === "done") {
           answered = true;
-          answerEl.innerHTML = ev.html || `<p style="color:var(--text-secondary)"><em>No content yet.</em></p>`;
+          answerEl.innerHTML = ev.html || `<div class="empty-state"><h2>No content yet</h2><p>Ask again, or build a walkthrough for this game.</p></div>`;
           hydrate(answerEl);
           setStatus("");
           await loadState(state.selected?.slug, false);
@@ -3720,12 +4166,17 @@ async function streamEndpoint(url, payload, promptDisplay) {
     }
   } catch (err) {
     if (seq !== streamSeq) return;
+    const message = "Could not complete your request. Check your connection and try again.";
     showMessage(answerEl, "Could not complete your request.", "Check your connection and try again.");
+    showToast(message, true);
     setStatus("");
+  } finally {
+    if (seq === streamSeq) setBusy("");
   }
 }
 
 window.triggerBuildWalkthrough = function() {
+  if (state.busy) return;
   if (!state.selected) {
     openGameModal(false);
     return;
@@ -3733,7 +4184,8 @@ window.triggerBuildWalkthrough = function() {
   streamEndpoint(
     "/api/walkthrough",
     { backend: state.backend, spoiler: state.spoiler, game: state.selected.slug },
-    `Build full walkthrough for ${state.selected.name} (Hint / Strategy / Answer + Pics & Videos)`
+    `Build full walkthrough for ${state.selected.name} (Hint / Strategy / Answer + Pics & Videos)`,
+    "walkthrough"
   );
 };
 
@@ -3741,10 +4193,12 @@ document.getElementById("build-walkthrough-btn").addEventListener("click", () =>
 
 document.getElementById("ask-form").addEventListener("submit", e => {
   e.preventDefault();
+  if (state.busy) return;
   const input = document.getElementById("question-input");
   const q = input.value.trim();
   if (!q) return;
   input.value = "";
+  syncAskButton();
   streamEndpoint(
     "/api/ask",
     {
@@ -3753,23 +4207,38 @@ document.getElementById("ask-form").addEventListener("submit", e => {
       game: state.selected ? state.selected.slug : "",
       question: q,
     },
-    q
+    q,
+    "ask"
   );
 });
 
+document.getElementById("question-input").addEventListener("input", syncAskButton);
+
 document.getElementById("new-chat-btn").addEventListener("submit", e => e.preventDefault());
 document.getElementById("new-chat-btn").addEventListener("click", async () => {
-  await fetch("/api/new-chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-  setStatus("Started a new conversation.");
-  showToast("Conversation context reset");
+  const button = document.getElementById("new-chat-btn");
+  button.disabled = true;
+  try {
+    await requestJSON("/api/new-chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    setStatus("Started a new conversation.");
+    showToast("Conversation context reset");
+  } catch (err) {
+    reportFailure(err.message || "Couldn't start a new chat.");
+  } finally {
+    button.disabled = false;
+  }
 });
 
+syncSpoilerChrome();
+syncAskButton();
+
 const initialGame = new URLSearchParams(window.location.search).get("game");
-if (initialGame) document.querySelector(".app-shell").classList.remove("library-mode");
+if (initialGame) document.querySelector(".app-shell").classList.remove("library-mode", "progress-mode");
 // First run with no AI connected: open Setup so the walkthrough is the first thing you see.
 Promise.all([loadState(initialGame, true), loadSetup()]).then(() => {
   if (setupInfo && !setupInfo.ready && !state.games.length) openSetupModal();
 });
+checkForUpdates(true);
 </script>
 </body>
 </html>

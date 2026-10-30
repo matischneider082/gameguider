@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -169,6 +170,204 @@ class PageScriptTests(unittest.TestCase):
             result = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_page_marks_pending_work_errors_empty_states_and_spoiler_level(self):
+        page = web.HTML_PAGE
+        self.assertIn('id="spoiler-banner"', page)
+        self.assertIn("Hint is on. Strategy and answers stay hidden.", page)
+        self.assertIn('id="ask-submit" disabled', page)
+        self.assertIn("No answer yet", page)
+        self.assertIn("No walkthrough for", page)
+        self.assertIn("function setBusy", page)
+        self.assertIn("function requestJSON", page)
+        self.assertIn('id="lightbox-close"', page)
+
+    def test_selecting_a_game_leaves_progress_and_reports_that_it_is_opening(self):
+        """The progress panel and the opening status both have to survive: either side alone drops the other."""
+        page = web.HTML_PAGE
+        start = page.find("window.selectGame = function(slug)")
+        body = page[start:page.find("window.checkForUpdates", start)]
+        self.assertIn('remove("library-mode", "progress-mode")', body)
+        self.assertIn('setStatus("Opening game…")', body)
+        self.assertIn("loadState(slug, true).then", body)
+
+    def test_progress_mode_hides_the_spoiler_banner_and_skips_the_chapter_filter(self):
+        """The shelf already hides the banner. Progress is the same kind of page, and / must not focus a hidden chapter box."""
+        page = web.HTML_PAGE
+        self.assertRegex(
+            page,
+            r"\.library-mode \.spoiler-banner,\s*\.progress-mode \.spoiler-banner\s*\{[^}]*display:\s*none",
+        )
+        slash = page[page.find('e.key === "/"'):page.find("let streamSeq")]
+        self.assertIn('contains("progress-mode")', slash)
+        self.assertLess(slash.find('contains("progress-mode")'), slash.find("chapter-filter"))
+        self.assertIn("? null", slash)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_page_script_toasts_server_errors_and_shows_busy_state(self):
+        script = re.search(r"<script[^>]*>(.*?)</script>", web.HTML_PAGE, re.S).group(1)
+        harness = r"""
+const cache = {};
+function make(id) {
+  const classes = new Set();
+  return {
+    id,
+    classList: {
+      add(...xs) { xs.forEach(c => classes.add(c)); },
+      remove(...xs) { xs.forEach(c => classes.delete(c)); },
+      toggle(c, force) {
+        const on = force === undefined ? !classes.has(c) : Boolean(force);
+        if (on) classes.add(c); else classes.delete(c);
+        return on;
+      },
+      contains: (c) => classes.has(c),
+    },
+    dataset: {}, style: {}, hidden: false, disabled: false, textContent: "", innerHTML: "",
+    value: "", open: false, checked: false, isConnected: true,
+    addEventListener() {}, setAttribute() {}, getAttribute() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    focus() {}, click() {}, append() {}, appendChild() {}, replaceChildren() {}, remove() {},
+    getClientRects() { return [1]; },
+  };
+}
+var document = {
+  body: make("body"),
+  documentElement: make("html"),
+  activeElement: null,
+  getElementById(id) { if (!cache[id]) cache[id] = make(id); return cache[id]; },
+  querySelector(sel) { return sel === ".app-shell" ? this.getElementById("app-shell") : null; },
+  querySelectorAll() { return []; },
+  addEventListener() {},
+  createElement: () => make("el"),
+};
+var window = global;
+window.location = { search: "" };
+function jsonResponse(status, obj) {
+  const text = JSON.stringify(obj);
+  return { ok: status < 400, status, text: async () => text, json: async () => obj };
+}
+var walkHold = null;
+var failSpoiler = null;
+var holdLevel = null;
+var holdGate = null;
+var holdFirst = null;
+var heldFirst = false;
+var fetch = async (url) => {
+  const u = String(url);
+  if (u.includes("/api/setup")) return jsonResponse(200, {ready:true, checks:[], ai:[], notes_dir:"/tmp", can_open_terminal:false});
+  if (u.includes("/api/walkthrough")) {
+    if (walkHold) await walkHold;
+    return jsonResponse(400, {error:"No AI connected."});
+  }
+  if (u.includes("/api/games/reorder")) return jsonResponse(500, {error:"Could not save the queue."});
+  if (u.includes("/api/state")) {
+    const spoiler = new URL(u, "http://127.0.0.1").searchParams.get("spoiler");
+    if (holdGate && spoiler === holdLevel) await holdGate;
+    if (holdFirst && !heldFirst) { heldFirst = true; await holdFirst; }
+    if (failSpoiler && spoiler === failSpoiler) return jsonResponse(500, {error:"state failed"});
+    return jsonResponse(200, {
+      games: [{slug:"hk", name:"Hollow Knight", status:"Backlog"}, {slug:"cel", name:"Celeste", status:"Backlog"}],
+      selected: {slug:"hk", name:"Hollow Knight", status:"Playing", spot:"Dirtmouth"},
+      walkthrough: [], notes_html: "VISIBLE:" + spoiler, raw_notes: "", media: [], maps: [],
+    });
+  }
+  return jsonResponse(500, {error:"unexpected " + u});
+};
+function fail(msg) { console.error(msg); process.exit(1); }
+"""
+        epilogue = r"""
+await new Promise((resolve, reject) => {
+  const start = Date.now();
+  const tick = () => {
+    if (state.games.length === 2) return resolve();
+    if (Date.now() - start > 2000) return reject(new Error("state did not load: " + document.getElementById("toast").textContent));
+    setTimeout(tick, 10);
+  };
+  tick();
+});
+const toast = document.getElementById("toast");
+if (toast.textContent) fail("boot toast: " + toast.textContent);
+await window.moveGame("hk", 1);
+if (!toast.textContent.includes("Could not save the queue.")) fail("reorder toast: " + toast.textContent);
+if (!toast.classList.contains("error")) fail("reorder toast was not marked as an error");
+let release;
+walkHold = new Promise(r => { release = r; });
+window.triggerBuildWalkthrough();
+await new Promise(r => setTimeout(r, 30));
+const build = document.getElementById("build-walkthrough-btn");
+if (build.textContent !== "Building…") fail("build label: " + build.textContent);
+if (!build.disabled) fail("build button stayed enabled");
+if (!document.getElementById("answer-content").innerHTML.includes("Building the walkthrough")) fail("missing pending copy");
+release();
+await new Promise((resolve, reject) => {
+  const start = Date.now();
+  const tick = () => {
+    if (build.textContent === "Build walkthrough" && !build.disabled) return resolve();
+    if (Date.now() - start > 2000) return reject(new Error("build stayed busy: " + build.textContent));
+    setTimeout(tick, 10);
+  };
+  tick();
+});
+if (!toast.textContent.includes("No AI connected.")) fail("walkthrough toast: " + toast.textContent);
+failSpoiler = "answer";
+await window.setSpoiler("answer");
+if (state.spoiler !== "hint") fail("spoiler changed to " + state.spoiler);
+const banner = document.getElementById("spoiler-banner");
+if (banner.dataset.level !== "hint") fail("banner level " + banner.dataset.level);
+if (!banner.textContent.includes("Hint is on")) fail("banner: " + banner.textContent);
+if (!toast.textContent.includes("Still showing Hint")) fail("spoiler toast: " + toast.textContent);
+failSpoiler = null;
+await window.setSpoiler("strategy");
+if (state.spoiler !== "strategy") fail("spoiler stayed " + state.spoiler);
+if (banner.dataset.level !== "strategy") fail("banner did not follow strategy");
+if (!banner.textContent.includes("Answers stay hidden")) fail("strategy banner: " + banner.textContent);
+await window.setSpoiler("answer");
+if (banner.dataset.level !== "answer") fail("answer banner: " + banner.textContent);
+let releaseHint;
+holdLevel = "hint";
+holdGate = new Promise(r => { releaseHint = r; });
+const lowering = window.setSpoiler("hint");
+await new Promise(r => setTimeout(r, 30));
+const notes = document.getElementById("notes-content").innerHTML;
+if (!notes.includes("VISIBLE:answer")) fail("page changed before hint loaded: " + notes);
+if (banner.dataset.level !== "answer") fail("banner claimed Hint early: " + banner.textContent);
+if (!banner.textContent.includes("Nothing is hidden")) fail("banner text while answer is showing: " + banner.textContent);
+releaseHint();
+holdGate = null;
+await lowering;
+if (state.spoiler !== "hint") fail("hint did not stick: " + state.spoiler);
+if (!document.getElementById("notes-content").innerHTML.includes("VISIBLE:hint")) fail("hint page missing");
+if (banner.dataset.level !== "hint") fail("banner did not follow hint: " + banner.textContent);
+state.spoiler = "hint";
+syncSpoilerChrome();
+let releaseAnswer;
+holdFirst = new Promise(r => { releaseAnswer = r; });
+heldFirst = false;
+const raising = window.setSpoiler("answer");
+await new Promise((resolve, reject) => {
+  const start = Date.now();
+  const tick = () => {
+    if (heldFirst) return resolve();
+    if (Date.now() - start > 2000) return reject(new Error("answer request did not start"));
+    setTimeout(tick, 10);
+  };
+  tick();
+});
+const newer = loadState("hk", false);
+await newer;
+releaseAnswer();
+await raising;
+if (state.spoiler !== "answer") fail("superseded switch reverted to " + state.spoiler);
+if (!document.getElementById("notes-content").innerHTML.includes("VISIBLE:answer")) fail("newer page was lost");
+if (banner.dataset.level !== "answer") fail("banner after a superseded switch: " + banner.textContent);
+console.log("ok");
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "page.cjs"
+            path.write_text(harness + script + "\n;(async () => {\n" + epilogue + "\n})().catch(err => { console.error(err); process.exit(1); });\n", encoding="utf-8")
+            result = subprocess.run(["node", str(path)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("ok", result.stdout)
+
 
 class StateAndStaticTests(WebServerTestCase):
     def test_share_download_is_portable_respects_spoilers_and_omits_notes_by_default(self):
@@ -223,6 +422,34 @@ class StateAndStaticTests(WebServerTestCase):
             status, data = self.post_json("/api/updates/check", {})
         self.assertEqual(status, 200)
         self.assertEqual(data["status"], "current")
+
+    def test_the_page_checks_for_updates_on_launch_and_only_speaks_up_when_one_exists(self):
+        page = web.HTML_PAGE
+        self.assertIn("checkForUpdates(true);\n</script>", page)
+        start = page.find("window.checkForUpdates = async function(quiet)")
+        body = page[start:page.find("window.prepareShare", start)]
+        self.assertIn('if (quiet && data.status !== "available") return;', body)
+        self.assertIn('if (!quiet) result.textContent = "Could not check', body)
+
+    def test_the_update_button_installs_through_the_api_and_refuses_when_nothing_is_newer(self):
+        status, _, html = self.request("GET", "/")
+        self.assertIn(b'id="install-update"', html)
+        with mock.patch.object(updates, "install_update", return_value={"status": "installed", "message": "done"}):
+            status, data = self.post_json("/api/updates/install", {})
+        self.assertEqual((status, data["status"]), (200, "installed"))
+        with mock.patch.object(updates, "install_update", side_effect=ValueError("There is no newer release to install on this copy.")):
+            status, data = self.post_json("/api/updates/install", {})
+        self.assertEqual(status, 409)
+
+    def test_adding_a_game_asks_for_the_title_and_tucks_the_rest_away(self):
+        page = web.HTML_PAGE
+        form = page[page.find('id="game-modal-form"'):page.find('id="modal-delete-btn"')]
+        more = form[form.find('<details id="modal-more">'):form.find("</details>")]
+        for field in ("modal-game-platform", "modal-game-genre", "modal-game-status", "modal-game-spot", "modal-game-notes"):
+            self.assertIn(f'id="{field}"', more)
+        self.assertNotIn("modal-game-name", more)  # the title stays outside, always visible and required
+        self.assertIn('id="modal-auto-walkthrough"', form[form.find("</details>"):])
+        self.assertIn('document.getElementById("modal-more").open = isEdit && !!state.selected;', page)
 
     def test_root_serves_web_ui_html_with_ad_free_player_and_walkthrough(self):
         status, headers, data = self.request("GET", "/")
@@ -398,6 +625,47 @@ class StateAndStaticTests(WebServerTestCase):
             self.assertEqual(status, 403, traversal)
             self.assertNotIn(b"TOPSECRET", body)
 
+    def test_progress_endpoint_reads_the_notes_folder_and_sees_later_edits(self):
+        status, _, page = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        html = page.decode("utf-8")
+        self.assertIn('id="progress-nav"', html)
+        self.assertIn("showProgress", html)
+        self.assertIn("/api/progress", html)
+
+        status, data = self.get_json("/api/progress")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["counts"], {"Playing": 1, "Backlog": 0, "Paused": 0, "Beaten": 0, "Dropped": 0})
+        self.assertEqual(data["backlog"], [])
+        self.assertEqual(data["progress"], [{
+            "name": "Hollow Knight",
+            "slug": "hollow-knight",
+            "status": "Playing",
+            "spot": "Mantis Lords",
+            "chapters": 2,
+            "current": 2,
+            "percent": 100,
+            "chapter": "2. Fungal Wastes",
+        }])
+        self.assertEqual([row["slug"] for row in data["recent"]], ["hollow-knight"])
+
+        aged = time.time() - (2 * 86400 + 12 * 3600)
+        for name in ("hollow-knight.md", "hollow-knight.walkthrough.md"):
+            os.utime(self.games_dir / name, (aged, aged))
+        status, aged_payload = self.get_json("/api/progress")
+        self.assertEqual((status, aged_payload["recent"][0]["ago"]), (200, "2 days ago"))
+
+        games = (self.games_dir / "GAMES.md").read_text(encoding="utf-8")
+        (self.games_dir / "GAMES.md").write_text(games + "| Celeste | PC | platformer | Backlog | | 2026-10-20 |\n", encoding="utf-8")
+        status, again = self.get_json("/api/progress")
+        self.assertEqual(status, 200)
+        self.assertEqual(again["counts"]["Backlog"], 1)
+        self.assertEqual(again["backlog"], [{
+            "name": "Celeste", "slug": "celeste", "platform": "PC", "spot": "", "position": 1,
+        }])
+        self.assertEqual([row["slug"] for row in again["progress"]], ["hollow-knight"])
+        self.assertEqual([row["slug"] for row in again["recent"]], ["hollow-knight"])
+
 
 class GameSavingAndTrackingTests(WebServerTestCase):
     def test_save_update_spot_notes_and_delete_game_via_api(self):
@@ -555,6 +823,22 @@ class MediaEndpointsTests(WebServerTestCase):
                                            headers={"Content-Type": "application/json"})
             self.assertEqual((status, json.loads(data)), (400, {"error": "Invalid JSON body"}))
 
+    def test_an_oversized_or_negative_body_does_not_run(self):
+        # A real empty object clears the conversation. A huge or negative
+        # Content-Length must not be parsed as that object: the unread bytes
+        # would also be the next request on a keep-alive connection.
+        self.server.conversation.sessions["claude"] = "keep"
+        for length, expect in (("1000001", 413), ("-1", 400)):
+            status, _, data = self.request(
+                "POST", "/api/new-chat", body=b"{}",
+                headers={"Content-Type": "application/json", "Content-Length": length},
+            )
+            self.assertEqual((status, json.loads(data).get("ok")), (expect, None), length)
+            self.assertEqual(self.server.conversation.sessions.get("claude"), "keep", length)
+        status, payload = self.post_json("/api/new-chat", {})
+        self.assertEqual((status, payload), (200, {"ok": True}))
+        self.assertEqual(self.server.conversation.sessions, {})
+
     def test_missing_media_tools_offer_a_youtube_fallback(self):
         with mock.patch.object(media, "missing", return_value=["yt-dlp"]):
             responses = (
@@ -639,9 +923,43 @@ class MediaEndpointsTests(WebServerTestCase):
             self.assertEqual(headers.get("content-length"), "4")
             self.assertEqual(part, b"2345")
 
+            # A suffix range is the tail of the file, and an unsatisfiable range is 416.
+            status, headers, tail = self.request("GET", f"/api/video/{vid}", headers={"Range": "bytes=-4"})
+            self.assertEqual((status, tail), (206, b"CDEF"))
+            self.assertEqual(headers.get("content-range"), f"bytes 12-15/{len(video_bytes)}")
+            status, _, _ = self.request("GET", f"/api/video/{vid}", headers={"Range": "bytes=100-200"})
+            self.assertEqual(status, 416)
+
         # Reject invalid video ID with 400
         status, _ = self.get_json("/api/video/invalid!")
         self.assertEqual(status, 400)
+
+    def test_a_malformed_range_does_not_return_a_short_body_as_200(self):
+        vid = "Bc-UtkWMuus"
+        video_file = self.cache_dir / f"{vid}.video.mp4"
+        video_bytes = b"0123456789ABCDEF"
+        video_file.write_bytes(video_bytes)
+        with mock.patch.object(media, "download", return_value=video_file):
+            # `2-nope` used to parse the start, fail the end, and answer 200 with only the tail.
+            status, headers, part = self.request("GET", f"/api/video/{vid}", headers={"Range": "bytes=2-nope"})
+        self.assertEqual(status, 200)
+        self.assertEqual(part, video_bytes)
+        self.assertEqual(headers.get("content-length"), str(len(video_bytes)))
+        self.assertNotIn("content-range", headers)
+
+    def test_a_video_removed_before_it_is_sent_is_not_a_server_error(self):
+        vid = "Bc-UtkWMuus"
+        video_file = self.cache_dir / f"{vid}.video.mp4"
+        video_file.write_bytes(b"0123456789ABCDEF")
+
+        def download(_video):
+            video_file.unlink()
+            return video_file
+
+        with mock.patch.object(media, "download", side_effect=download):
+            status, _, data = self.request("GET", f"/api/video/{vid}")
+        self.assertEqual(status, 404)
+        self.assertIn(b"not found", data.lower())
 
 
 class StreamingAskAndSessionsTests(WebServerTestCase):

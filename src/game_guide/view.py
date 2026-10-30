@@ -6,9 +6,13 @@ share export and CLI are adapters over it; URLs and rendering stay with them."""
 from __future__ import annotations
 
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
+from . import cache
 from .notes import (
     IMAGE_EXTS,
     LEVELS,
@@ -18,10 +22,12 @@ from .notes import (
     current_chapter,
     games_dir,
     images,
-    read_notes,
+    linked_image_paths,
+    notes_path,
     read_walkthrough,
     redact,
     videos,
+    walkthrough_path,
 )
 
 _MAP = re.compile(r"(?:^|[^a-z0-9])(?:map|maps|minimap|mini-map|atlas)(?:$|[^a-z0-9])", re.I)
@@ -67,12 +73,51 @@ class Progress:
     percent: int
 
 
+_VIEWS: OrderedDict = OrderedDict()
+_VIEW_LOCK = threading.Lock()
+_VIEW_MAX = 128
+_PATHS: OrderedDict = OrderedDict()
+
+
+def _image_stamp(notes_stamp, walk_stamp, linked: str, base: Path) -> tuple:
+    """Stat the images `linked` names. The path list is remembered for an unchanged notes file, so a
+    repeat view only stats those files and still notices one appearing or disappearing."""
+    key = (str(base), notes_stamp, walk_stamp)
+    paths = cache.MISS
+    if notes_stamp is not None and walk_stamp is not None:
+        paths = cache.recall(_PATHS, key, _VIEW_LOCK)
+    if paths is cache.MISS:
+        paths = linked_image_paths(linked, base)
+        if notes_stamp is not None and walk_stamp is not None:
+            cache.remember(_PATHS, key, paths, _VIEW_MAX, _VIEW_LOCK)
+    return tuple((path, cache.file_stamp(path)) for path in paths)
+
+
 def game_view(game: Game, spoiler: str, directory=None) -> GameView:
     """What the player may see of `game` at `spoiler` (anything unknown means "hint"); a cut level leaves notes.HIDDEN_NOTE."""
     spoiler = spoiler if spoiler in LEVELS else "hint"
     base = games_dir(directory)
-    notes = re.sub(rf"\A#\s+{re.escape(game.name)}\s*\n", "", redact(read_notes(game, base), spoiler))
-    walkthrough = read_walkthrough(game, base)
+    raw_notes, notes_stamp = cache.load(notes_path(game, base))
+    walkthrough, walk_stamp = cache.load(walkthrough_path(game, base))
+    linked = f"{raw_notes}\0{walkthrough}"
+    images_stamp = _image_stamp(notes_stamp, walk_stamp, linked, base)
+    key = (game.name, game.spot, spoiler, str(base), notes_stamp, walk_stamp, images_stamp)
+    if notes_stamp is not None and walk_stamp is not None:
+        hit = cache.recall(_VIEWS, key, _VIEW_LOCK)
+        if hit is not cache.MISS:
+            return GameView(game, spoiler, *hit)
+    view = _assemble(game, spoiler, base, raw_notes, walkthrough)
+    if notes_stamp is not None and walk_stamp is not None and _image_stamp(notes_stamp, walk_stamp, linked, base) == images_stamp:
+        cache.remember(
+            _VIEWS, key,
+            (view.notes, view.preamble, view.chapters, view.current, view.maps, view.media),
+            _VIEW_MAX, _VIEW_LOCK,
+        )
+    return view
+
+
+def _assemble(game: Game, spoiler: str, base: Path, raw_notes: str, walkthrough: str) -> GameView:
+    notes = re.sub(rf"\A#\s+{re.escape(game.name)}\s*\n", "", redact(raw_notes, spoiler))
     sections = chapters(walkthrough)
     here = current_chapter(sections, game.spot)  # before redacting: the spot may be named only in a hidden level
     shown = []
@@ -119,6 +164,7 @@ def search(query: str, games: list[Game], spoiler: str, directory=None, limit: i
     return (titled + rest)[:limit]
 
 
+@lru_cache(maxsize=1024)
 def _plain(markdown: str) -> str:
     """Roughly the text a reader sees: no headings markers, emphasis, image embeds or link targets."""
     text = re.sub(r"!\[\[[^\]]*\]\]|!\[[^\]]*\]\([^)]*\)", " ", markdown)

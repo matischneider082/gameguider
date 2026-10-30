@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,7 +22,14 @@ RELEASES = f"repos/{REPO}/releases/latest"
 
 
 def _version(text: str) -> tuple[int, ...]:
-    return tuple(int(n) for n in re.findall(r"\d+", text)[:3])
+    """Up to three numeric components, zero-padded so 1.2 and 1.2.0 compare equal.
+
+    A bare tuple compare treats a missing component as smaller than 0, so an installed 1.2 looked older than a release tagged 1.2.0.
+    """
+    parts = [int(n) for n in re.findall(r"\d+", text)[:3]]
+    if not parts:
+        return ()
+    return tuple(parts + [0] * (3 - len(parts)))
 
 
 def _latest_release() -> dict | None:
@@ -125,3 +133,27 @@ def check_for_updates(root: Path | None = None) -> dict:
                                   f"git pull --ff-only {REPO_URL} {BRANCH}\n"
                                   "mise run setup\nmise run install-app")
     return result
+
+
+def _installer_command() -> list[str]:
+    base = f"https://github.com/{REPO}/releases/latest/download/"
+    if sys.platform == "win32":
+        return ["powershell", "-NoProfile", "-Command", f"irm {base}install.ps1 | iex"]
+    return ["sh", "-c", f"curl -fsSL {base}install.sh | sh"]
+
+
+def install_update() -> dict:
+    """Run the release installer for an installed copy that has a newer release. A source checkout is never touched:
+    it updates with git. The caller reopens GameGuider afterwards; the running copy keeps working until then."""
+    check = check_for_updates()
+    if check["status"] != "available" or "latest" not in check:
+        raise ValueError("There is no newer release to install on this copy.")
+    try:
+        result = subprocess.run(_installer_command(), capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "error", "message": "Could not run the installer. Check your connection, then try again."}
+    if result.returncode != 0:
+        tail = "\n".join((result.stderr or result.stdout).strip().splitlines()[-5:])
+        return {"status": "error", "message": "The installer failed.", "detail": tail}
+    return {"status": "installed", "latest": check["latest"],
+            "message": f"GameGuider {check['latest']} is installed. Quit and reopen GameGuider to use it."}

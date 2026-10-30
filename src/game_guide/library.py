@@ -16,7 +16,7 @@ import threading
 from contextlib import suppress
 from pathlib import Path
 
-from .notes import Game, games_dir, notes_path, slugify, today_iso
+from .notes import Game, games_dir, notes_path, read_text, slugify, today_iso
 
 # Re-entrant because save_game runs inside batch_add_games and update_game.
 # The AI CLI writes GAMES.md from another process: there the rename, not this lock, is what protects readers.
@@ -38,11 +38,8 @@ def write_atomic(path: Path, text: str) -> None:
 
 
 def read_games(directory=None):
-    path = games_dir(directory) / "GAMES.md"
-    if not path.exists():
-        return []
     header, games = None, []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_text(games_dir(directory) / "GAMES.md").splitlines():
         if not line.lstrip().startswith("|"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -77,11 +74,19 @@ def discover_games(directory=None, requested_game: str | None = None) -> list[Ga
     seen_slugs = {g.slug for g in tracked}
     if base.exists():
         for walk_file in sorted(base.glob("*.walkthrough.md")):
-            slug = walk_file.name[: -len(".walkthrough.md")]
-            if slug and slug not in seen_slugs:
-                title = _walkthrough_title(walk_file) or slug.replace("-", " ").title()
-                tracked.append(Game(name=title, status="Walkthrough"))
-                seen_slugs.add(slugify(title))
+            stem = walk_file.name.removesuffix(".walkthrough.md")
+            # Compare the folded slug, not the raw filename: Pokémon.walkthrough.md is pokemon.
+            file_slug = slugify(stem)
+            if not file_slug or file_slug in seen_slugs:
+                continue
+            title = _walkthrough_title(walk_file) or stem.replace("-", " ").title()
+            title_slug = slugify(title)
+            if title_slug in seen_slugs:
+                continue
+            tracked.append(Game(name=title, status="Walkthrough"))
+            seen_slugs.add(file_slug)
+            if title_slug:
+                seen_slugs.add(title_slug)
     if requested_game:
         req_slug = slugify(requested_game)
         if req_slug and req_slug not in seen_slugs:
@@ -108,11 +113,14 @@ def write_games(games: list[Game], directory=None) -> Path:
 
     with _LOCK:
         prefix_lines: list[str] = []
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if line.lstrip().startswith("|"):
-                    break
-                prefix_lines.append(line)
+        try:
+            existing = path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            existing = ""
+        for line in existing.splitlines():
+            if line.lstrip().startswith("|"):
+                break
+            prefix_lines.append(line)
 
         table_lines = [
             "| Game | Platform | Genre | Status | Spot | Updated |",
@@ -379,7 +387,10 @@ def append_note(
             game_obj = update_game(game_obj.slug, spot=spot, directory=base)
 
         path = notes_path(game_obj, base)
-        current = path.read_text(encoding="utf-8").rstrip() if path.exists() else ""
+        try:
+            current = path.read_text(encoding="utf-8", errors="replace").rstrip()
+        except FileNotFoundError:
+            current = ""
         clean_entry = entry.strip()
         if not clean_entry:
             return path

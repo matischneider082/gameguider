@@ -7,17 +7,21 @@ script hydrates; the share export gets a standalone file, with images as data: U
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import mimetypes
 import re
+import threading
 import urllib.parse
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
-from .notes import HIDDEN_NOTE, IMAGE_EXTS, YOUTUBE, videos
+from . import cache
+from .notes import HIDDEN_NOTE, IMAGE_EXTS, YOUTUBE, linked_image_stamp, videos
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
@@ -34,10 +38,30 @@ class Policy:
     image_bytes: int = 0  # inlined so far
 
 
+_HTML: OrderedDict = OrderedDict()
+_HTML_LOCK = threading.Lock()
+_HTML_MAX = 512
+_PARSER = threading.local()
+
+
 def render(text: str, directory: Path, policy: Policy | None = None) -> str:
     """`text`, written in the notes folder `directory`, as HTML under `policy` (the web page's by default)."""
     policy = policy or Policy()
     base = Path(directory).resolve()
+    if policy.share:  # share tallies inlined bytes on the policy; a cache hit would skip that
+        return _render(text, base, policy)
+    stamp = linked_image_stamp(text, base)
+    key = (hashlib.blake2s(text.encode("utf-8", "surrogatepass"), digest_size=16).digest(), str(base), stamp)
+    hit = cache.recall(_HTML, key, _HTML_LOCK)
+    if hit is not cache.MISS:
+        return hit
+    html_out = _render(text, base, policy)
+    if linked_image_stamp(text, base) == stamp:
+        cache.remember(_HTML, key, html_out, _HTML_MAX, _HTML_LOCK)
+    return html_out
+
+
+def _render(text: str, base: Path, policy: Policy) -> str:
     md = _markdown()
     tokens = md.parse(text)
     for i, token in enumerate(tokens):
@@ -58,12 +82,16 @@ def render(text: str, directory: Path, policy: Policy | None = None) -> str:
 
 
 def _markdown() -> MarkdownIt:
-    # A fresh instance per call (~0.2 ms): the server renders on many threads; MarkdownIt promises no thread safety.
-    md = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable(["table", "linkify"])
-    md.inline.ruler.before("image", "wiki_image", _wiki_image)
-    md.block.ruler.before("list", "video", _video_line, {"alt": ["paragraph", "reference", "blockquote", "list"]})
-    md.block.ruler.before("list", "reveal", _reveal_line)
-    md.core.ruler.push("prose_videos", _prose_videos)
+    # MarkdownIt is not thread-safe, and building one is most of a short chapter's render.
+    # One parser per thread is reused; each parse() gets a fresh token state.
+    md = getattr(_PARSER, "md", None)
+    if md is None:
+        md = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable(["table", "linkify"])
+        md.inline.ruler.before("image", "wiki_image", _wiki_image)
+        md.block.ruler.before("list", "video", _video_line, {"alt": ["paragraph", "reference", "blockquote", "list"]})
+        md.block.ruler.before("list", "reveal", _reveal_line)
+        md.core.ruler.push("prose_videos", _prose_videos)
+        _PARSER.md = md
     return md
 
 

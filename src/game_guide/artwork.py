@@ -4,11 +4,15 @@ and embeds it in the walkthrough preamble. Built on the notes module's read side
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 
+from . import cache
 from .library import write_atomic
 from .notes import IMAGE, IMAGE_EXTS, Game, games_dir, images, read_walkthrough, slugify, walkthrough_path
 
@@ -18,6 +22,11 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
+
+
+_ART: OrderedDict = OrderedDict()
+_ART_LOCK = threading.Lock()
+_ART_MAX = 256
 
 
 def game_artwork_path(game: Game | str, directory=None) -> Path | None:
@@ -30,7 +39,28 @@ def game_artwork_path(game: Game | str, directory=None) -> Path | None:
     game_img_dir = (images_root / slug).resolve()
     if not game_img_dir.is_relative_to(images_root):
         return None
+    walk = walkthrough_path(Game(slug), base)
+    dir_stamp, walk_stamp = _listing(game_img_dir), cache.file_stamp(walk)
+    key = (str(base), slug, dir_stamp, walk_stamp)
+    hit = cache.recall(_ART, key, _ART_LOCK)
+    if hit is not cache.MISS:
+        return hit
+    found = _find_artwork(game_img_dir, images_root, base, slug)
+    if _listing(game_img_dir) == dir_stamp and cache.file_stamp(walk) == walk_stamp:
+        cache.remember(_ART, key, found, _ART_MAX, _ART_LOCK)
+    return found
 
+
+def _listing(directory: Path) -> tuple[str, ...] | None:
+    """The file names in a folder. Windows does not bump a folder's modified time when a file is added to it, so the
+    stamp that follows single files cannot tell that a cover appeared."""
+    try:
+        return tuple(sorted(entry.name for entry in os.scandir(directory)))
+    except OSError:
+        return None
+
+
+def _find_artwork(game_img_dir: Path, images_root: Path, base: Path, slug: str) -> Path | None:
     # 1. Explicit cover/artwork/boxart/keyart/poster/banner/hero file in images/<slug>/
     if game_img_dir.is_dir():
         for stem in COVER_STEMS:

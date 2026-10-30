@@ -12,7 +12,7 @@ import urllib.parse
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from . import doctor, media, scores, settings, sharing, themes, updates
+from . import doctor, media, scores, settings, sharing, stats, themes, updates
 from .artwork import fetch_game_artwork, game_artwork_path
 from .backends import BACKENDS, SPOILERS
 from .conversation import Conversation, Update
@@ -229,6 +229,14 @@ def state(query: dict, directory: Path | None = None) -> dict:
     return state_payload(query.get("game"), query.get("spoiler"), directory)
 
 
+def overview(_query: dict | None = None, directory: Path | None = None) -> dict:
+    """Status counts, the backlog queue, recent notes, and walkthrough progress.
+
+    Read from the notes folder on every call, like `state`, so an edit shows up the next time the panel asks.
+    """
+    return stats.overview(directory)
+
+
 def search(query: dict, directory: Path | None = None) -> dict:
     """Notes and chapters across the library holding every word of q, at the spoiler level (see view.search)."""
     text = str(query.get("q") or "").strip()[:200]
@@ -286,6 +294,13 @@ def save_theme(body: dict) -> dict:
 
 def check_updates(_body: dict | None = None) -> dict:
     return updates.check_for_updates()
+
+
+def install_update(_body: dict | None = None) -> dict:
+    try:
+        return updates.install_update()
+    except ValueError as exc:
+        raise ActionError(409, str(exc)) from None
 
 
 def refresh_artwork(body: dict, directory: Path | None = None) -> dict:

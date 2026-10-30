@@ -69,8 +69,16 @@ class Conversation:
         token = self._supersede()
         events = ask(backend, framed(question, spoiler, game), self.sessions.get(backend))
         with self._lock:
-            if self._token == token:
+            if self._token != token:
+                stale = True
+            else:
                 self._active = events
+                stale = False
+        if stale:
+            # Cancelled before this CLI was registered, so nothing else will close it. Don't start it:
+            # the first event is already too late, the process can edit notes before it prints anything.
+            events.close()
+            return
         try:
             with closing(events):
                 for event in events:
@@ -109,17 +117,20 @@ class Conversation:
 
     def reset(self):
         """A new conversation: cancel the running question and forget every backend's session."""
-        self._supersede()
-        self.sessions.clear()
+        self._supersede(clear=True)
 
     def cancel(self):
         """Stop the running question, as when the server closes."""
         self._supersede()
 
-    def _supersede(self) -> int:
+    def _supersede(self, clear: bool = False) -> int:
         with self._lock:
             self._token += 1
             token, older, self._active = self._token, self._active, None
+            if clear:
+                # Same lock as the session write. Clearing after the release let a question that
+                # started in between store a session and then lose it.
+                self.sessions.clear()
         if older is not None:
             with suppress(Exception):  # "already executing" on its own thread: it stops at its next token check
                 older.close()

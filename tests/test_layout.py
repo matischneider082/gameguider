@@ -21,6 +21,10 @@ class Layout(unittest.IsolatedAsyncioTestCase):
             app = GameGuide()
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.pause()
+                for _ in range(50):  # a slow runner (Windows CI) lays the list out some pauses later
+                    if app.query("#games ListItem")[1].region.height:
+                        break
+                    await pilot.pause(0.1)
                 main = app.query_one("#main")
                 # A long unbreakable URL used to widen the right pane past the window, cutting every line off.
                 self.assertLessEqual(main.region.right, 120)

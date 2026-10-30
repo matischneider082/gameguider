@@ -1,5 +1,7 @@
 """Textual TUI: games on the left, notes / answer / media on the right, a question box at the bottom."""
 
+import math
+import threading
 import webbrowser
 from contextlib import closing
 
@@ -7,21 +9,43 @@ from contextlib import closing
 import textual_image.renderable  # noqa: F401
 from textual import work
 from textual.app import App
+from textual.binding import Binding
 from textual.css.query import NoMatches
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Input, Label, ListItem, ListView, Markdown, OptionList, Select, Static, TabbedContent, TabPane
 from textual.worker import get_current_worker
 from textual_image.widget import Image
 
-from . import media, procs
+from . import media, procs, scores
 from .backends import BACKENDS, SPOILERS
 from .conversation import Conversation, Done, Error, Status, walkthrough_prompt
 from .library import read_games, update_game
-from .notes import Video
+from .notes import Video, games_dir
 from .view import game_view
 
 TABS = ["notes-tab", "walk-tab", "answer-tab", "media-tab"]
 STATUS_ICON = {"playing": "▶", "backlog": "📋", "paused": "‖", "beaten": "✓", "dropped": "✗"}
+SCORE_FAILED = "Couldn't fetch a critic score. Check your connection and try again."
+
+
+def shown_score(value):
+    """Round a critic average the way the Web UI does (half away from zero, not banker's rounding)."""
+    return math.floor(float(value) + 0.5)
+
+
+def format_critic(score):
+    """The header sentence for a cached score, or the prompt to fetch one."""
+    if not score:
+        return "No critic score yet. ctrl+g fetches one."
+    reviews = f" ({score['count']})" if score.get("count") else ""
+    return f"Critics {shown_score(score['score'])}/100 · {score['source']}{reviews}"
+
+
+def game_list_label(game, cached):
+    icon = STATUS_ICON.get(game.status.lower(), " ")
+    score = scores.score_for(game, cached)
+    mark = f"  {shown_score(score['score'])}/100" if score else ""
+    return f"{icon} {game.name}{mark}"
 
 
 class GameGuide(App):
@@ -29,7 +53,9 @@ class GameGuide(App):
     CSS = """
     #games { width: 30; border-right: solid $panel; }
     #games Label { width: 1fr; }  /* wrap long names instead of cutting them off */
-    #main { width: 1fr; }
+    #detail { width: 1fr; }
+    #critic { height: 1; padding: 0 1; }
+    #main { width: 1fr; height: 1fr; }
     #media-side { width: 40; }
     #walk-side { width: 34; }
     #chapters { height: 1fr; }
@@ -49,6 +75,9 @@ class GameGuide(App):
         ("u", "open_video", "Open on YouTube"),
         ("s", "set_spot", "Set chapter as spot"),
         ("w", "walkthrough", "Build walkthrough"),
+        Binding("c", "score", "Critic score"),
+        # ctrl+g reaches the action while the question box is focused; c does not, because that box takes letters.
+        Binding("ctrl+g", "score", show=False),
         ("o", "open_web", "Open Web UI"),
         ("r", "reload", "Reload"),
         ("ctrl+n", "new_chat", "New conversation"),
@@ -58,30 +87,36 @@ class GameGuide(App):
     def __init__(self):
         super().__init__()
         self.games, self.game, self.media, self.chapters = [], None, [], []
+        self.scores = {}
+        self._score_gen = 0
+        self._score_gen_lock = threading.Lock()
+        self._score_lock = threading.Lock()  # one cache write at a time; the UI thread never takes this
         self.conversation, self.web_server = Conversation(), None
 
     def compose(self):
         with Horizontal():
             yield ListView(id="games")
-            with TabbedContent(id="main"):
-                with TabPane("Notes", id="notes-tab"):
-                    yield VerticalScroll(Markdown(id="notes"))
-                with TabPane("Walkthrough", id="walk-tab"):
-                    with Horizontal():
-                        with Vertical(id="walk-side"):
-                            yield OptionList(id="chapters", markup=False)
-                            yield Static("enter  ask about this chapter\ns      set chapter as spot\nw      build or rebuild it", id="walk-keys")
-                        yield VerticalScroll(Markdown(id="chapter"))
-                with TabPane("Answer", id="answer-tab"):
-                    yield VerticalScroll(Markdown("Ask something below.", id="answer"))
-                with TabPane("Media", id="media-tab"):
-                    with Horizontal():
-                        with Vertical(id="media-side"):
-                            yield OptionList(id="sources", markup=False)
-                            yield Static("p  play from the timestamp\nf  still frames around it\nu  open on YouTube", id="media-keys")
-                        with VerticalScroll():
-                            yield Image(id="preview")
-                            yield Horizontal(id="frames")
+            with Vertical(id="detail"):
+                yield Static("", id="critic", markup=False)
+                with TabbedContent(id="main"):
+                    with TabPane("Notes", id="notes-tab"):
+                        yield VerticalScroll(Markdown(id="notes"))
+                    with TabPane("Walkthrough", id="walk-tab"):
+                        with Horizontal():
+                            with Vertical(id="walk-side"):
+                                yield OptionList(id="chapters", markup=False)
+                                yield Static("enter  ask about this chapter\ns      set chapter as spot\nw      build or rebuild it", id="walk-keys")
+                            yield VerticalScroll(Markdown(id="chapter"))
+                    with TabPane("Answer", id="answer-tab"):
+                        yield VerticalScroll(Markdown("Ask something below.", id="answer"))
+                    with TabPane("Media", id="media-tab"):
+                        with Horizontal():
+                            with Vertical(id="media-side"):
+                                yield OptionList(id="sources", markup=False)
+                                yield Static("p  play from the timestamp\nf  still frames around it\nu  open on YouTube", id="media-keys")
+                            with VerticalScroll():
+                                yield Image(id="preview")
+                                yield Horizontal(id="frames")
         with Horizontal(id="ask"):
             yield Select([(s, s) for s in SPOILERS], value="hint", allow_blank=False, id="spoiler")
             yield Select([(b, b) for b in BACKENDS], value="claude", allow_blank=False, id="backend")
@@ -114,14 +149,16 @@ class GameGuide(App):
     def action_reload(self):
         current = self.game.name if self.game else None
         self.games = read_games()
+        self.scores = scores.read_scores(games_dir())
         view = self.query_one("#games", ListView)
         view.clear()
-        view.extend(ListItem(Label(f"{STATUS_ICON.get(g.status.lower(), ' ')} {g.name}", markup=False)) for g in self.games)
+        view.extend(ListItem(Label(game_list_label(g, self.scores), markup=False)) for g in self.games)
         names = [g.name for g in self.games]
         if names:
             view.index = names.index(current) if current in names else 0
             self.show_game(self.games[view.index])
         else:
+            self.query_one("#critic", Static).update("")
             self.query_one("#notes", Markdown).update("No games tracked yet. Tell it what you're playing below.")
 
     def on_tabbed_content_tab_activated(self, event):
@@ -139,6 +176,7 @@ class GameGuide(App):
             self.workers.cancel_group(self, "preview")  # its frames belong to the previous game
         self.game = game
         view = game_view(game, self.query_one("#spoiler", Select).value)
+        self.query_one("#critic", Static).update(format_critic(scores.score_for(game, self.scores)))
         header = f"# {game.name}\n\n{game.platform} · {game.genre} · {game.status} · at **{game.spot or '?'}**\n\n"
         self.query_one("#notes", Markdown).update(header + (view.notes or "_No notes yet._"))
         if switched:
@@ -193,6 +231,47 @@ class GameGuide(App):
             return self.notify("Pick or add a game first.")
         # All three levels whatever the selector says: the tab redacts them, and they let you raise it later.
         self.submit(walkthrough_prompt(self.game.name), walkthrough=True)
+
+    def action_score(self):
+        """Fetch the selected game's critic score. Wikidata or IGDB, not the AI CLI, so a missing backend must not block it."""
+        if not self.game:
+            return self.notify("Pick or add a game first.")
+        with self._score_gen_lock:
+            self._score_gen += 1
+            gen = self._score_gen
+        self.set_status(f"Fetching critic score for {self.game.name}…")
+        self.fetch_score(self.game, gen)
+
+    @work(thread=True, exclusive=True, group="score")
+    def fetch_score(self, game, gen):
+        with self._score_lock:
+            with self._score_gen_lock:
+                if gen != self._score_gen:
+                    return
+            if get_current_worker().is_cancelled:
+                return
+            try:
+                score = scores.refresh_score(game, games_dir())
+                message = None
+            except (ValueError, OSError) as exc:
+                score, message = None, str(exc)
+            except Exception:
+                score, message = None, SCORE_FAILED
+        if get_current_worker().is_cancelled:
+            return
+        self.from_worker(self._apply_score_result, game, gen, score, message)
+
+    def _apply_score_result(self, game, gen, score, message):
+        if gen != self._score_gen:  # a newer fetch owns the status line
+            return
+        if score is None:
+            self.set_status(message)
+            return
+        self.action_reload()
+        if self.game and self.game.slug == game.slug:
+            self.set_status(format_critic(score))
+        else:
+            self.set_status(f"Saved a critic score for {game.name}.")
 
     def on_select_changed(self, event):
         if event.select.id == "spoiler" and self.game:

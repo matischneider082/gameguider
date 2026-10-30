@@ -6,7 +6,6 @@ Never read or reuse the CLIs' login tokens: driving the official binaries is wha
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import tempfile
@@ -143,7 +142,7 @@ def ask(backend, question, session=None):
     last_text, finished = "", False
     with tempfile.TemporaryFile("w+") as stderr, \
             procs.start(cmd, cwd=notes, env={**os.environ, "GAME_GUIDE_DIR": str(notes)}, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE, stderr=stderr, text=True) as proc:  # own group, no tty input; tracked so quitting the TUI kills it
+                        stdout=subprocess.PIPE, stderr=stderr, text=True, errors="replace") as proc:  # own group, no tty input; a kill mid-character must not raise
         try:
             for line in proc.stdout:
                 try:
@@ -169,11 +168,12 @@ def ask(backend, question, session=None):
             # Closing the generator early (a superseded question) must not leave the CLI running and editing notes.
             # The whole tree, so yt-dlp/uv children the CLI spawned die with it.
             procs.untrack(proc)
-            procs.kill_tree(proc.pid, signal.SIGTERM)
+            procs.kill_tree(proc.pid)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                procs.kill_tree(proc.pid, signal.SIGKILL)
+                procs.kill_tree(proc.pid, force=True)
+                proc.wait(timeout=5)
 
 
 def claude_command(question, session, notes):
