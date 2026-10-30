@@ -15,7 +15,7 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import actions, media, procs
+from . import actions, media, procs, themes
 from .actions import ActionError
 from .conversation import Conversation, Done, Error, Status, Text
 from .notes import Video, games_dir
@@ -26,6 +26,7 @@ GET_ACTIONS = {"/api/state": actions.state, "/api/setup": actions.setup, "/api/s
 POST_ACTIONS = {
     "/api/setup": actions.save_setup,
     "/api/setup/terminal": actions.setup_terminal,
+    "/api/theme": actions.save_theme,
     "/api/updates/check": actions.check_updates,
     "/api/games/artwork": actions.refresh_artwork,
     "/api/scores/refresh": actions.refresh_score,
@@ -195,7 +196,9 @@ class GuideRequestHandler(BaseHTTPRequestHandler):
             self._send_json(e.status, {"error": e.message})
 
     def _send_page(self, _query: dict):
-        self._send_bytes(200, "text/html; charset=utf-8", HTML_PAGE.encode("utf-8"), cache="no-store")
+        # themes.current() only returns names from its own closed list, so it's safe inside the attribute.
+        page = HTML_PAGE.replace('<html lang="en">', f'<html lang="en" data-theme="{themes.current()}">', 1)
+        self._send_bytes(200, "text/html; charset=utf-8", page.encode("utf-8"), cache="no-store")
 
     def _send_share(self, query: dict):
         filename, content = actions.share(query)
@@ -365,11 +368,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --plum-soft: rgba(194, 135, 153, 0.16);
     --danger: #f08360;
     --danger-soft: rgba(217, 107, 67, 0.15);
+    --on-accent: #121316;
+    --track: rgba(255, 255, 255, 0.07);
+    --bar: rgba(14, 16, 20, 0.92);
+    --bar-soft: rgba(14, 16, 20, 0.45);
+    color-scheme: dark;
     --radius: 8px;
     --radius-sm: 6px;
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
     --font-mono: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
   }
+  /*__THEMES__*/
   * { box-sizing: border-box; }
   html, body {
     margin: 0;
@@ -461,7 +470,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .guide-hits h2 { margin:28px 0 10px; font-size:16px; }
   .guide-hits p { color:var(--text-secondary); font-size:14px; }
   .guide-hits ul { list-style:none; margin:0; padding:0; display:grid; gap:8px; }
-  .guide-hit { display:grid; gap:4px; width:100%; text-align:left; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--text); cursor:pointer; font:inherit; }
+  .guide-hit { display:grid; gap:4px; width:100%; text-align:left; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--surface-1); color:var(--text); cursor:pointer; font:inherit; }
   .guide-hit:hover, .guide-hit:focus-visible { border-color:var(--accent-border); }
   .guide-hit-place { font-weight:600; font-size:13px; }
   .guide-hit-snippet { color:var(--text-secondary); font-size:13px; line-height:1.5; }
@@ -471,7 +480,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .ai-connect h3 { margin:0; font-size:15px; }
   .ai-connect p { margin:0; font-size:13px; color:var(--text-secondary); }
   .ai-options { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:8px; }
-  .ai-option { display:grid; gap:2px; text-align:left; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--text); font:inherit; cursor:pointer; }
+  .ai-option { display:grid; gap:2px; text-align:left; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--surface-1); color:var(--text); font:inherit; cursor:pointer; }
   .ai-option span { font-size:12px; color:var(--text-secondary); }
   .ai-option.active { border-color:var(--accent); background:var(--accent-soft); }
   .ai-steps { list-style:none; margin:0; padding:0; display:grid; gap:10px; }
@@ -556,7 +565,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .btn-primary {
     background: var(--accent);
-    color: #121316;
+    color: var(--on-accent);
     border-color: var(--accent);
     font-weight: 600;
   }
@@ -716,7 +725,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .game-progress-bar {
     flex: 1;
     height: 5px;
-    background: rgba(255, 255, 255, 0.07);
+    background: var(--track);
     border-radius: 999px;
     overflow: hidden;
   }
@@ -803,7 +812,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .topbar-spot-bar {
     padding: 8px 24px 10px;
-    background: rgba(14, 16, 20, 0.45);
+    background: var(--bar-soft);
     border-top: 1px solid var(--border);
     display: flex;
     align-items: center;
@@ -1087,7 +1096,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: sticky;
     top: 0;
     z-index: 20;
-    background: rgba(14, 16, 20, 0.92);
+    background: var(--bar);
     backdrop-filter: blur(8px);
     display: flex;
     align-items: center;
@@ -1431,7 +1440,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     height: 40px;
     border-radius: 999px;
     background: var(--accent);
-    color: #121316;
+    color: var(--on-accent);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1442,7 +1451,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: absolute;
     bottom: 6px;
     right: 6px;
-    background: rgba(14, 16, 20, 0.9);
+    background: var(--bar);
     color: var(--accent);
     font-family: var(--font-mono);
     font-size: 12px;
@@ -2009,6 +2018,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="modal-body">
         <section class="ai-connect" id="ai-connect" aria-live="polite"></section>
         <ul class="setup-list" id="setup-list"></ul>
+        <div class="form-field">
+          <label for="theme-select">Theme</label>
+          <select id="theme-select" class="form-input" onchange="setTheme(this.value)"><!--__THEME_OPTIONS__--></select>
+        </div>
         <div class="form-field">
           <label for="setup-notes-dir">Notes folder</label>
           <input type="text" id="setup-notes-dir" class="form-input" spellcheck="false" autocomplete="off" placeholder="~/Documents/GameGuider">
@@ -3009,8 +3022,22 @@ async function loadSetup() {
   renderSetup();
 }
 
+window.setTheme = async function(name) {
+  const before = document.documentElement.dataset.theme || "dark";
+  document.documentElement.dataset.theme = name;  // try it at once; undone below if it can't be saved
+  try {
+    const resp = await fetch("/api/theme", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ theme: name }) });
+    if (!resp.ok) throw new Error();
+  } catch (err) {
+    document.documentElement.dataset.theme = before;
+    document.getElementById("theme-select").value = before;
+    showToast("Could not save the theme. Please try again.");
+  }
+};
+
 window.openSetupModal = async function() {
   modalReturnFocus = document.activeElement;
+  document.getElementById("theme-select").value = document.documentElement.dataset.theme || "dark";
   setModalStatus("setup-modal-status", "");
   document.getElementById("setup-modal").classList.add("open");
   await loadSetup();
@@ -3741,3 +3768,5 @@ Promise.all([loadState(initialGame, true), loadSetup()]).then(() => {
 </body>
 </html>
 """
+HTML_PAGE = HTML_PAGE.replace("/*__THEMES__*/", themes.css()).replace(
+    "<!--__THEME_OPTIONS__-->", "".join(f'<option value="{name}">{label}</option>' for name, label in themes.CHOICES.items()))

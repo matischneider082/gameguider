@@ -1,5 +1,6 @@
 """Settings that outlive a run, in $XDG_CONFIG_HOME/game-guide/config.json (~/.config/... by default): today the
-notes folder, so the desktop app (which gets no shell environment) and the CLI agree on where the notes live."""
+notes folder, so the desktop app (which gets no shell environment) and the CLI agree on where the notes live, and
+the color theme."""
 
 from __future__ import annotations
 
@@ -37,9 +38,14 @@ def set_notes_dir(path: str) -> Path:
     if folder == Path(folder.anchor) or Path.home().resolve().is_relative_to(folder):
         raise ValueError("Choose a folder inside your home folder, not your home folder itself or one above it.")
     folder.mkdir(parents=True, exist_ok=True)
+    save("notes_dir", str(folder))
+    return folder
+
+
+def save(key: str, value) -> None:
+    """Set one setting, keeping the others; the file is replaced whole so a reader never sees half of it."""
     target = config_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.tmp")
-    temp.write_text(json.dumps({**load(), "notes_dir": str(folder)}, indent=2) + "\n", encoding="utf-8")
+    temp.write_text(json.dumps({**load(), key: value}, indent=2) + "\n", encoding="utf-8")
     os.replace(temp, target)
-    return folder

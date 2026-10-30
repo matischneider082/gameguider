@@ -141,7 +141,7 @@ In the Web UI, search your library by title, platform, or genre and filter it by
 
 In the Web UI, use **Backlog List** to paste bulleted, numbered, or plain multiline lists. Select the **Backlog** filter and use the arrow buttons to reorder the queue. Each line accepts `Game | Platform | Genre | Notes`; default platform and genre are optional, and cover fetching can be enabled for the whole batch.
 
-In the Web UI, **Setup** in the sidebar shows the same checks and lets you change the notes folder. A banner on the shelf appears when GameGuider can't research guides yet, for example when neither the Claude nor the Codex CLI is installed.
+In the Web UI, **Setup** in the sidebar shows the same checks and lets you change the notes folder and the **Theme**: Match system (dark or light, following your Mac or PC), Dark, Light, or High contrast. The theme applies at once and is saved in `~/.config/game-guide/config.json`. A banner on the shelf appears when GameGuider can't research guides yet, for example when neither the Claude nor the Codex CLI is installed.
 
 In Claude Code, say "I just started Elden Ring on PS5", or run `/game-guide:game-guide how do I beat Malenia`.
 

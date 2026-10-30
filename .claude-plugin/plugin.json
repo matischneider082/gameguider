@@ -1,6 +1,6 @@
 {
   "name": "game-guide",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Track the games you're playing and distill wikis and YouTube guides into spoiler-aware help for the spot you're stuck on.",
   "author": { "name": "GameGuider" }
 }

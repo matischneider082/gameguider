@@ -12,7 +12,7 @@ import urllib.parse
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from . import doctor, media, scores, settings, sharing, updates
+from . import doctor, media, scores, settings, sharing, themes, updates
 from .artwork import fetch_game_artwork, game_artwork_path
 from .backends import BACKENDS, SPOILERS
 from .conversation import Conversation, Update
@@ -275,6 +275,13 @@ def setup_terminal(body: dict) -> dict:
     except (OSError, subprocess.SubprocessError):
         raise ActionError(500, "Could not open Terminal. Copy the command and run it yourself.") from None
     return {"ok": True}
+
+
+def save_theme(body: dict) -> dict:
+    try:
+        return {"theme": themes.save(_text(body, "theme"))}
+    except ValueError as exc:
+        raise ActionError(400, str(exc)) from None
 
 
 def check_updates(_body: dict | None = None) -> dict:
